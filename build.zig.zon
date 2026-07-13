@@ -1,0 +1,16 @@
+.{
+    .name = .reverse_proxy,
+    .version = "0.0.0",
+    .fingerprint = 0x29f859324259828a, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // See `zig fetch --save <url>` for a command-line interface for adding dependencies.
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "LICENSE",
+        "README.md",
+    },
+}
