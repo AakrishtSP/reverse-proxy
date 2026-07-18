@@ -1,71 +1,43 @@
 const std = @import("std");
-const Io = std.Io;
-
-const reverse_proxy = @import("root.zig");
+const Config = @import("config.zig");
+const StdIo = @import("stdio.zig").StdIo;
 
 pub fn main(init: std.process.Init) !void {
-    // Prints to stderr, unbuffered, ignoring potential errors.
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
-
-    // This is appropriate for anything that lives as long as the process.
-    const arena: std.mem.Allocator = init.arena.allocator();
-
-    // Accessing command line arguments:
-    const args = try init.minimal.args.toSlice(arena);
-    for (args) |arg| {
-        std.log.info("arg: {s}", .{arg});
+    var stdio = StdIo.init(init);
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer {
+        const status = gpa.deinit();
+        if (status == .leak) std.debug.print("Warning: Memory leak found\n", .{});
     }
 
-    // In order to do I/O operations need an `Io` instance.
-    const io = init.io;
+    const allocator = gpa.allocator();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
 
-    // Stdout is for the actual output of your application, for example if you
-    // are implementing gzip, then only the compressed bytes should be sent to
-    // stdout, not any debugging messages.
-    var stdout_buffer: [1024]u8 = undefined;
-    var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
-    const stdout_writer = &stdout_file_writer.interface;
-
-    try reverse_proxy.printAnotherMessage(stdout_writer);
-
-    try stdout_writer.flush(); // Don't forget to flush!
+    var path_buf: [std.posix.PATH_MAX]u8 = undefined;
+    const path = Config.resolveConfigPath(init, &path_buf) catch |err| switch (err) {
+        error.FileNotFound => {
+            try stdio.eprintln("Error: File not Found", .{});
+            try stdio.println("Do you want to create a default config? (y/n) ", .{});
+            try stdio.flush();
+            const answer = try stdio.readChar();
+            if (answer != 'y') return;
+            return Config.writeDefaultConfig(init, "config.zon") catch |er| {
+                try stdio.eprintln("Error: {any}\n", .{er});
+                return er;
+            };
+        },
+        else => return err,
+    };
+    const config = try Config.load(init, arena_allocator, path);
+    try Config.printConfig(config, &stdio);
 }
 
 test "simple test" {
-    const gpa = std.testing.allocator;
+    const gp = std.testing.allocator;
     var list: std.ArrayList(i32) = .empty;
-    defer list.deinit(gpa); // Try commenting this out and see if zig detects the memory leak!
-    try list.append(gpa, 42);
+    defer list.deinit(gp); // Try commenting this out and see if zig detects the memory leak!
+    try list.append(gp, 42);
     try std.testing.expectEqual(@as(i32, 42), list.pop());
-}
-
-test "fuzz example" {
-    try std.testing.fuzz({}, testOne, .{});
-}
-
-fn testOne(context: void, smith: *std.testing.Smith) !void {
-    _ = context;
-    // Try passing `--fuzz` to `zig build test` and see if it manages to fail this test case!
-
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(u8) = .empty;
-    defer list.deinit(gpa);
-    while (!smith.eos()) switch (smith.value(enum { add_data, dup_data })) {
-        .add_data => {
-            const slice = try list.addManyAsSlice(gpa, smith.value(u4));
-            smith.bytes(slice);
-        },
-        .dup_data => {
-            if (list.items.len == 0) continue;
-            if (list.items.len > std.math.maxInt(u32)) return error.SkipZigTest;
-            const len = smith.valueRangeAtMost(u32, 1, @min(32, list.items.len));
-            const off = smith.valueRangeAtMost(u32, 0, @intCast(list.items.len - len));
-            try list.appendSlice(gpa, list.items[off..][0..len]);
-            try std.testing.expectEqualSlices(
-                u8,
-                list.items[off..][0..len],
-                list.items[list.items.len - len ..],
-            );
-        },
-    };
 }
