@@ -37,57 +37,36 @@ pub fn load(init: Init, allocator: std.mem.Allocator, path: []const u8) !Config 
     };
 }
 
+fn exists(init: Init, path: []const u8) !bool {
+    std.Io.Dir.cwd().access(init.io, path, .{ .read = true }) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return true;
+}
+
 pub fn resolveConfigPath(init: Init, buf: []u8) ![]const u8 {
     const home = init.environ_map.get("HOME") orelse "";
-    const xdg = init.environ_map.get("XDG_CONFIG_HOME");
-    if (xdg) |x| {
+
+    if (init.environ_map.get("XDG_CONFIG_HOME")) |xdg| {
         const path = try std.fmt.bufPrint(
             buf,
             "{s}/reverse-proxy/config.zon",
-            .{x},
+            .{xdg},
         );
-        if (std.Io.Dir.cwd().access(init.io, path, .{ .read = true })) |_| {
-            return path;
-        } else |err| switch (err) {
-            error.FileNotFound => {},
-            else => return err,
-        }
+        if (try exists(init, path)) return path;
     }
-    {
-        const path = try std.fmt.bufPrint(
-            buf,
-            "{s}/.config/reverse-proxy/config.zon",
-            .{home},
-        );
-        if (std.Io.Dir.cwd().access(init.io, path, .{ .read = true })) |_| {
-            return path;
-        } else |err| switch (err) {
-            error.FileNotFound => {},
-            else => return err,
-        }
+
+    inline for ([_][]const u8{
+        "{s}/.config/reverse-proxy/config.zon",
+        "{s}/.reverse-proxy/config.zon",
+    }) |fmt| {
+        const path = try std.fmt.bufPrint(buf, fmt, .{home});
+        if (try exists(init, path)) return path;
     }
-    {
-        const path = try std.fmt.bufPrint(
-            buf,
-            "{s}/.reverse-proxy/config.zon",
-            .{home},
-        );
-        if (std.Io.Dir.cwd().access(init.io, path, .{ .read = true })) |_| {
-            return path;
-        } else |err| switch (err) {
-            error.FileNotFound => {},
-            else => return err,
-        }
-    }
-    {
-        const path = "config.zon";
-        if (std.Io.Dir.cwd().access(init.io, path, .{ .read = true })) |_| {
-            return path;
-        } else |err| switch (err) {
-            error.FileNotFound => {},
-            else => return err,
-        }
-    }
+
+    if (try exists(init, "config.zon"))
+        return "config.zon";
 
     return error.FileNotFound;
 }
