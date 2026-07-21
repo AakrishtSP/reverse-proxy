@@ -8,7 +8,7 @@ BENCH_DIR="$REPO_ROOT/bench"
 CONF="$BENCH_DIR/backend-bench.conf"
 PIDFILE="$BENCH_DIR/nginx.pid"
 
-TARGET_URL="${1:-http://localhost:9000/}"
+TARGET_URL="${1:-http://localhost:8880/}"
 DURATION="${2:-30s}"
 CONNECTIONS="${3:-100}"
 THREADS="${4:-4}"
@@ -30,7 +30,7 @@ http {
     scgi_temp_path        $BENCH_DIR/tmp/scgi;
 
     server {
-        listen 9000;
+        listen 8888;
         location / {
             return 200 "ok\n";
         }
