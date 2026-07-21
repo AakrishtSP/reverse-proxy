@@ -19,3 +19,8 @@ zig-out/
 
 tmp
 *.log
+
+bench/*
+!bench/bench.sh
+!bench/harness.sh
+!bench/results.jsonl

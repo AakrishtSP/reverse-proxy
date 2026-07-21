@@ -3,7 +3,7 @@
 # tears the backend down after — even on failure/Ctrl-C, via trap.
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BENCH_DIR="$REPO_ROOT/bench"
 CONF="$BENCH_DIR/backend-bench.conf"
 PIDFILE="$BENCH_DIR/nginx.pid"
