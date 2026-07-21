@@ -38,7 +38,7 @@ TARGET_URL="http://localhost:8880/"
 : "${WRK_ARGS:=-L}"
 
 VENV_PY="$REPO_ROOT/.venv/bin/python3"
-[ -x "$VENV_PY" ] || { echo "missing $VENV_PY — run: python3 -m venv .venv && .venv/bin/pip install ipykernel" >&2; exit 1; }
+[ -x "$VENV_PY" ] || { echo "missing $VENV_PY — run: python3 -m venv .venv && .venv/bin/pip install ipykernel pandas matplotlib" >&2; exit 1; }
 
 parse_and_emit() {
     local out="$1" conn="$2" rep="$3"
