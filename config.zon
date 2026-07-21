@@ -6,5 +6,5 @@
             .backends = .{"127.0.0.1:8000"},
         },
     },
-    .default_backends = null,
+    .default_backends = .{"127.0.0.1:9000"},
 }

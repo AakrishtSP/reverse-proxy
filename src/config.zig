@@ -89,13 +89,20 @@ pub fn printConfig(config: Config, stdio: *StdIo) !void {
         for (vhost.hostnames) |hostname| {
             try stdio.print("\t\"{s}\", ", .{hostname});
         }
-        try stdio.print("}}\n\t\t\t.backends: .{{", .{});
+        try stdio.print("}},\n\t\t\t.backends: .{{", .{});
         for (vhost.backends) |backend| {
             try stdio.print("\t\"{s}\", ", .{backend});
         }
-        try stdio.println("}}\n\t\t}}", .{});
+        try stdio.println("}},\n\t\t}},", .{});
     }
 
-    try stdio.println("\t}}\n}}", .{});
+    try stdio.println("\t}},", .{});
+    try stdio.print("\t.default_backends: .{{", .{});
+    if (config.default_backends) |backends| {
+        for (backends) |backend| {
+            try stdio.print("\t\"{s}\", ", .{backend});
+        }
+    }
+    try stdio.print("}},\n}}", .{});
     try stdio.flush();
 }

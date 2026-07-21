@@ -1,0 +1,5 @@
+2026/07/21 15:16:56 [emerg] 241180#241180: bind() to 0.0.0.0:9000 failed (98: Address already in use)
+2026/07/21 15:16:56 [alert] 241079#241079: unlink() "/home/asp/Projects/reverse-proxy/bench/nginx.pid" failed (2: No such file or directory)
+2026/07/21 15:17:27 [alert] 241188#241188: unlink() "/home/asp/Projects/reverse-proxy/bench/nginx.pid" failed (2: No such file or directory)
+2026/07/21 15:19:57 [alert] 241922#241922: unlink() "/home/asp/Projects/reverse-proxy/bench/nginx.pid" failed (2: No such file or directory)
+2026/07/21 15:20:43 [alert] 242162#242162: unlink() "/home/asp/Projects/reverse-proxy/bench/nginx.pid" failed (2: No such file or directory)
