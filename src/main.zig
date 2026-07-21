@@ -2,7 +2,7 @@ const std = @import("std");
 const Config = @import("config.zig");
 const StdIo = @import("stdio.zig").StdIo;
 const Router = @import("router.zig");
-
+const Server = @import("threaded/server.zig");
 pub fn main(init: std.process.Init) !void {
     var stdio = StdIo.init(init);
     var gpa: std.heap.DebugAllocator(.{}) = .init;
@@ -34,8 +34,8 @@ pub fn main(init: std.process.Init) !void {
     const config = try Config.load(init, arena_allocator, path);
     try Config.printConfig(config, &stdio);
 
-    const router = try Router.build(init.io, arena_allocator, config);
-    _ = router;
+    var router = try Router.build(init.io, arena_allocator, config);
+    try Server.run(arena_allocator, &router, config.listen);
 }
 
 test "simple test" {

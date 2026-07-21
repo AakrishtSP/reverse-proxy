@@ -8,14 +8,14 @@ pub const VhostConfig = struct {
 };
 
 pub const Config = struct {
-    listen: []const u8,
+    listen: u16,
     vhosts: []const VhostConfig,
     default_backends: ?[]const []const u8 = null,
 };
 
 const default_config_zon =
     \\.{
-    \\    .listen = "0.0.0.0:8080",
+    \\    .listen = 8080,
     \\    .vhosts = .{},
     \\    .default_backends = null,
     \\}
@@ -82,7 +82,7 @@ pub fn writeDefaultConfig(init: Init, path: []const u8) !void {
 
 pub fn printConfig(config: Config, stdio: *StdIo) !void {
     try stdio.println(".{{", .{});
-    try stdio.println("\t.listen: \"{s}\",", .{config.listen});
+    try stdio.println("\t.listen: {d},", .{config.listen});
     try stdio.println("\t.vhosts: \n\t.{{", .{});
     for (config.vhosts) |vhost| {
         try stdio.print("\t\t.{{\n\t\t\t.hostnames: .{{", .{});
