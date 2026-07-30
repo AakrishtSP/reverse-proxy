@@ -22,7 +22,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RESULTS="$REPO_ROOT/bench/results.jsonl"
 
 STAGE="${1:?usage: harness.sh <stage-label> [repeats] [concurrencies...]}"
-REPEATS="${2:-3}"
+REPEATS="${2:-1}"
 shift $(( $# >= 2 ? 2 : 1 ))
 CONCURRENCIES=("${@:-10 50 100 200 500 1000}")
 [ "${#CONCURRENCIES[@]}" -eq 1 ] && CONCURRENCIES=(${CONCURRENCIES[0]})

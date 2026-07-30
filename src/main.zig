@@ -38,10 +38,6 @@ pub fn main(init: std.process.Init) !void {
     try Server.run(arena_allocator, &router, config.listen);
 }
 
-test "simple test" {
-    const gp = std.testing.allocator;
-    var list: std.ArrayList(i32) = .empty;
-    defer list.deinit(gp); // Try commenting this out and see if zig detects the memory leak!
-    try list.append(gp, 42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
+test {
+    std.testing.refAllDecls(@This());
 }

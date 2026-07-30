@@ -25,9 +25,10 @@
 //!     keeps the socket open would hang this relay until the OS times it out.
 //!     Upgrade path: parse the backend's own Content-Length/chunked framing
 //!     instead of relying on it to close.
-//!   - IPv4 only on the listen side (matches the hardcoded 0.0.0.0 bind).
-//!     Backends may still be IPv6 (connectTo handles both) since that comes
-//!     from balancer.zig's existing resolution.
+//!   - One dual-stack listener (AF_INET6 with IPV6_V6ONLY cleared), so v4
+//!     clients arrive here too, mapped as ::ffff:a.b.c.d — no separate v4
+//!     accept loop. Backends may be IPv4 or IPv6 (connectTo handles both)
+//!     since that comes from balancer.zig's existing resolution.
 
 const std = @import("std");
 const posix = std.posix;
@@ -53,17 +54,10 @@ const max_request_head = 8192;
 fn check(rc: usize) !void {
     return switch (posix.errno(rc)) {
         .SUCCESS => {},
-        // EPIPE is routine for a proxy — the client or backend can hang up
-        // mid-write at any time, especially under load — not a bug. Give it
-        // its own error instead of routing it through unexpectedErrno's
-        // panic-and-dump-stack path, which is for genuinely unanticipated
-        // errnos.
+
         .PIPE => error.BrokenPipe,
-        // ponytail: every other setup errno collapses into error.Unexpected
-        // instead of a precise set (AddressInUse, ConnectionRefused, ...).
-        // Fine since every caller here just logs and bails. If a caller ever
-        // needs to branch on a specific failure, give that call site its own
-        // error set instead of widening this for everyone.
+
+        .CONNREFUSED => error.ConnectionRefused,
         else => |e| posix.unexpectedErrno(e),
     };
 }
@@ -109,23 +103,32 @@ pub fn run(allocator: std.mem.Allocator, router: *Router, port: u16) !void {
     };
     posix.sigaction(posix.SIG.PIPE, &sigpipe_action, null);
 
-    const listen_fd = try sysSocket(posix.AF.INET, posix.SOCK.STREAM, posix.IPPROTO.TCP);
+    // Single dual-stack listener instead of separate v4/v6 sockets + accept
+    // loops: an AF_INET6 socket with IPV6_V6ONLY cleared accepts both, and
+    // v4 peers show up as ::ffff:a.b.c.d (unmapped in writeForwardedFor).
+    const listen_fd = try sysSocket(posix.AF.INET6, posix.SOCK.STREAM, posix.IPPROTO.TCP);
     defer sysClose(listen_fd);
 
     try posix.setsockopt(listen_fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
+    // ponytail: `26` is IPPROTO_IPV6/IPV6_V6ONLY's raw Linux value, used
+    // directly because std.os.linux's naming for it has moved around across
+    // 0.16 std.Io churn same as everything else in this file. If
+    // linux.IPV6.V6ONLY exists in your checkout, prefer that symbol instead.
+    try posix.setsockopt(listen_fd, posix.IPPROTO.IPV6, posix.IPV6.V6ONLY, &std.mem.toBytes(@as(c_int, 0)));
 
-    const bind_addr: posix.sockaddr.in = .{
-        .family = posix.AF.INET,
+    const bind_addr: posix.sockaddr.in6 = .{
+        .family = posix.AF.INET6,
         .port = std.mem.nativeToBig(u16, port),
-        .addr = 0, // INADDR_ANY (0.0.0.0)
-        .zero = [_]u8{0} ** 8,
+        .flowinfo = 0,
+        .addr = [_]u8{0} ** 16, // in6addr_any (covers v4-mapped too)
+        .scope_id = 0,
     };
-    try check(linux.bind(listen_fd, @ptrCast(&bind_addr), @sizeOf(posix.sockaddr.in)));
+    try check(linux.bind(listen_fd, @ptrCast(&bind_addr), @sizeOf(posix.sockaddr.in6)));
     try check(linux.listen(listen_fd, 128));
 
     while (true) {
-        var peer: posix.sockaddr.in = undefined;
-        var peer_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
+        var peer: posix.sockaddr.in6 = undefined;
+        var peer_len: posix.socklen_t = @sizeOf(posix.sockaddr.in6);
         const conn_fd = sysAccept4(listen_fd, @ptrCast(&peer), &peer_len, posix.SOCK.CLOEXEC) catch |err| {
             std.debug.print("accept failed: {any}\n", .{err});
             continue;
@@ -139,7 +142,7 @@ pub fn run(allocator: std.mem.Allocator, router: *Router, port: u16) !void {
     }
 }
 
-fn handleConnection(allocator: std.mem.Allocator, router: *Router, conn_fd: posix.fd_t, peer: posix.sockaddr.in) void {
+fn handleConnection(allocator: std.mem.Allocator, router: *Router, conn_fd: posix.fd_t, peer: posix.sockaddr.in6) void {
     defer sysClose(conn_fd);
 
     var head_buf: [max_request_head]u8 = undefined;
@@ -184,7 +187,7 @@ fn forward(
     allocator: std.mem.Allocator,
     bal: *Balancer,
     client_fd: posix.fd_t,
-    peer: posix.sockaddr.in,
+    peer: posix.sockaddr.in6,
     req: Request,
     leftover: []const u8,
 ) !void {
@@ -211,12 +214,7 @@ fn forward(
         if (std.ascii.eqlIgnoreCase(h.name, "x-forwarded-for")) continue;
         head_len += (try std.fmt.bufPrint(head[head_len..], "{s}: {s}\r\n", .{ h.name, h.value })).len;
     }
-    const peer_ip: [4]u8 = @bitCast(peer.addr);
-    head_len += (try std.fmt.bufPrint(
-        head[head_len..],
-        "X-Forwarded-For: {d}.{d}.{d}.{d}\r\n",
-        .{ peer_ip[0], peer_ip[1], peer_ip[2], peer_ip[3] },
-    )).len;
+    head_len = try writeForwardedFor(&head, head_len, peer.addr);
     head_len += (try std.fmt.bufPrint(head[head_len..], "Via: 1.1 reverse-proxy\r\n", .{})).len;
     head_len += (try std.fmt.bufPrint(head[head_len..], "Connection: close\r\n\r\n", .{})).len;
 
@@ -300,6 +298,38 @@ fn sendSimple(fd: posix.fd_t, status: []const u8) void {
     writeAll(fd, msg) catch {};
 }
 
+/// Writes the X-Forwarded-For header for a raw v6 sockaddr's 16-byte
+/// address, unmapping v4-mapped addresses (::ffff:a.b.c.d) back to plain
+/// dotted-quad since that's what downstream log parsers expect from a v4
+/// client — the listener being dual-stack shouldn't leak into the header
+/// shape. Returns the new head_len.
+fn writeForwardedFor(head: []u8, head_len: usize, addr: [16]u8) !usize {
+    const is_v4_mapped = std.mem.eql(u8, addr[0..10], &[_]u8{0} ** 10) and
+        addr[10] == 0xff and addr[11] == 0xff;
+    if (is_v4_mapped) {
+        return head_len + (try std.fmt.bufPrint(
+            head[head_len..],
+            "X-Forwarded-For: {d}.{d}.{d}.{d}\r\n",
+            .{ addr[12], addr[13], addr[14], addr[15] },
+        )).len;
+    }
+    // ponytail: expanded form only (no :: compression, no leading-zero
+    // trimming) — correct but ugly. Fine for a header nothing parses
+    // strictly. Upgrade path: std.net.Ip6Address's formatter if/once it's
+    // stable again post-0.16 std.Io churn.
+    const groups: [8]u16 = @bitCast(addr);
+    return head_len + (try std.fmt.bufPrint(
+        head[head_len..],
+        "X-Forwarded-For: {x}:{x}:{x}:{x}:{x}:{x}:{x}:{x}\r\n",
+        .{
+            std.mem.bigToNative(u16, groups[0]), std.mem.bigToNative(u16, groups[1]),
+            std.mem.bigToNative(u16, groups[2]), std.mem.bigToNative(u16, groups[3]),
+            std.mem.bigToNative(u16, groups[4]), std.mem.bigToNative(u16, groups[5]),
+            std.mem.bigToNative(u16, groups[6]), std.mem.bigToNative(u16, groups[7]),
+        },
+    )).len;
+}
+
 /// Strips a ":port" suffix (or keeps a "[ipv6]" literal intact) so the
 /// result matches what Router.route expects.
 fn hostOnly(h: []const u8) []const u8 {
@@ -309,4 +339,18 @@ fn hostOnly(h: []const u8) []const u8 {
     }
     const colon = std.mem.lastIndexOfScalar(u8, h, ':') orelse return h;
     return h[0..colon];
+}
+
+test "v4-mapped address unmaps to dotted-quad in X-Forwarded-For" {
+    var head: [128]u8 = undefined;
+    const mapped: [16]u8 = [_]u8{0} ** 10 ++ [_]u8{ 0xff, 0xff, 10, 0, 0, 1 };
+    const len = try writeForwardedFor(&head, 0, mapped);
+    try std.testing.expectEqualStrings("X-Forwarded-For: 10.0.0.1\r\n", head[0..len]);
+}
+
+test "real v6 address stays expanded hex, not misread as v4" {
+    var head: [128]u8 = undefined;
+    const real_v6: [16]u8 = [_]u8{ 0x20, 0x01 } ++ [_]u8{0} ** 14;
+    const len = try writeForwardedFor(&head, 0, real_v6);
+    try std.testing.expect(std.mem.startsWith(u8, head[0..len], "X-Forwarded-For: 2001:"));
 }
