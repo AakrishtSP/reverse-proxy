@@ -1,4 +1,4 @@
-//! Thread-per-connection HTTP/1.1 proxy loop.
+//! Pooled-thread HTTP/1.1 proxy loop.
 //!
 //! Socket I/O here is raw std.posix (accept/connect/read/write/close), not
 //! std.Io.net. That's a deliberate downgrade, not an oversight: Io.net's
@@ -12,19 +12,31 @@
 //! pure data/parsing type (balancer.zig's DNS/hostname resolution is
 //! untouched) — only the actual socket syscalls changed.
 //!
+//! Concurrency model (thread pool): a fixed set of worker threads each run
+//! the accept-and-handle loop on the one shared dual-stack listening socket
+//! (linux.accept4 is thread-safe — the kernel hands each wake-up a distinct
+//! pending connection). This caps the number of live connections at
+//! pool_threads and amortizes thread-creation cost, unlike the earlier
+//! spawn-a-thread-per-connection design. No job queue: an idle worker that
+//! isn't blocking in accept is busy holding one keep-alive connection open,
+//! which is exactly what a keep-alive server wants (a connection stays pinned
+//! to the worker that accepted it).
+//!
 //! Current scope (deliberately narrow — see phase-2 epoll work for the rest):
-//!   - One request per connection. No pipelining/keep-alive to the client yet;
-//!     each accepted connection handles exactly one request/response then closes.
+//!   - Client keep-alive (HTTP/1.1). A connection is kept open across requests
+//!     as long as the client asked for it and the backend response has framing
+//!     (Content-Length or Transfer-Encoding) we can relay deterministically.
+//!     Responses without framing (delimited by connection-close) force the
+//!     client connection shut, since we can't know where one ends.
 //!   - Content-Length request bodies only. Chunked request bodies are refused
 //!     with 501 — forwarding them correctly needs http/chunked.zig's boundary
 //!     scanner (not built yet) to know where the body ends without decoding it.
-//!   - The backend response is relayed as raw bytes, unparsed, until the
-//!     backend closes its end. We always send it "Connection: close", so a
-//!     well-behaved backend closing after the response is what ends the relay.
+//!   - One backend connection per request: we always send the backend
+//!     "Connection: close" and relay its response until the backend closes.
 //!     ponytail: a misbehaving backend that ignores Connection: close and
 //!     keeps the socket open would hang this relay until the OS times it out.
-//!     Upgrade path: parse the backend's own Content-Length/chunked framing
-//!     instead of relying on it to close.
+//!     Upgrade path: keep backend connections pooled and/or parse its response
+//!     framing instead of relying on it to close.
 //!   - One dual-stack listener (AF_INET6 with IPV6_V6ONLY cleared), so v4
 //!     clients arrive here too, mapped as ::ffff:a.b.c.d — no separate v4
 //!     accept loop. Backends may be IPv4 or IPv6 (connectTo handles both)
@@ -44,6 +56,8 @@ const Router = RouterMod.Router;
 const Balancer = @import("../balancer.zig").Balancer;
 
 const max_request_head = 8192;
+const max_response_head = 8192;
+const pool_threads = 16;
 
 /// std.posix.{socket,bind,listen,accept,connect} were removed in 0.16
 /// (moved into std.Io.net's vtable). We already can't route through
@@ -126,6 +140,19 @@ pub fn run(allocator: std.mem.Allocator, router: *Router, port: u16) !void {
     try check(linux.bind(listen_fd, @ptrCast(&bind_addr), @sizeOf(posix.sockaddr.in6)));
     try check(linux.listen(listen_fd, 128));
 
+    // Take pool_threads - 1 slots from worker threads; this (main) thread
+    // becomes the last worker. Keeps run() blocking forever like the old
+    // single accept-loop did, and there's nothing useful for main to do
+    // besides pull its share of connections.
+    for (0..pool_threads - 1) |_| {
+        _ = std.Thread.spawn(.{}, workerLoop, .{ allocator, router, listen_fd }) catch |err| {
+            std.debug.print("thread spawn failed: {any}\n", .{err});
+        };
+    }
+    workerLoop(allocator, router, listen_fd);
+}
+
+fn workerLoop(allocator: std.mem.Allocator, router: *Router, listen_fd: posix.fd_t) void {
     while (true) {
         var peer: posix.sockaddr.in6 = undefined;
         var peer_len: posix.socklen_t = @sizeOf(posix.sockaddr.in6);
@@ -133,54 +160,64 @@ pub fn run(allocator: std.mem.Allocator, router: *Router, port: u16) !void {
             std.debug.print("accept failed: {any}\n", .{err});
             continue;
         };
-        const thread = std.Thread.spawn(.{}, handleConnection, .{ allocator, router, conn_fd, peer }) catch |err| {
-            std.debug.print("thread spawn failed: {any}\n", .{err});
-            sysClose(conn_fd);
-            continue;
-        };
-        thread.detach();
+        handleConnection(allocator, router, conn_fd, peer);
     }
 }
 
 fn handleConnection(allocator: std.mem.Allocator, router: *Router, conn_fd: posix.fd_t, peer: posix.sockaddr.in6) void {
     defer sysClose(conn_fd);
 
-    var head_buf: [max_request_head]u8 = undefined;
-    var len: usize = 0;
-    var parser: Parser = .{};
+    // Keep-alive loop: read one request, forward it, and only close when the
+    // client asked to or the response framing says we can't keep the
+    // connection unambiguous. The read buffer persists across requests so
+    // bytes already pulled off the socket (body leftovers, pipelined heads)
+    // aren't lost between iterations.
+    var buf: [max_request_head]u8 = undefined;
+    var start: usize = 0;
+    var end: usize = 0;
 
-    const req: Request = while (true) {
-        if (len == head_buf.len) {
-            sendSimple(conn_fd, "431 Request Header Fields Too Large");
-            return;
-        }
-
-        const n = posix.read(conn_fd, head_buf[len..]) catch |err| {
-            std.debug.print("read error: {any}\n", .{err});
-            return;
+    while (true) {
+        var parser: Parser = .{};
+        const req: Request = while (true) {
+            const got = parser.next(buf[start..end]) catch {
+                sendSimple(conn_fd, "400 Bad Request");
+                return;
+            };
+            if (got) |r| break r;
+            // else: headers not complete yet — need more data.
+            if (end == buf.len) {
+                sendSimple(conn_fd, "431 Request Header Fields Too Large");
+                return;
+            }
+            const n = posix.read(conn_fd, buf[end..]) catch |err| {
+                std.debug.print("read error: {any}\n", .{err});
+                return;
+            };
+            if (n == 0) return; // peer closed
+            end += n;
         };
-        if (n == 0) return; // peer closed before sending a full request
 
-        len += n;
+        start += req.consumed; // skip the request head; leftover is body/next-request
 
-        if (parser.next(head_buf[0..len])) |maybe_req| {
-            if (maybe_req) |r| break r;
-            // else: headers not complete yet, read more
-        } else |_| {
+        const host_header = req.header("host") orelse {
             sendSimple(conn_fd, "400 Bad Request");
             return;
-        }
-    };
+        };
+        const bal = router.route(hostOnly(host_header)) orelse return; // nginx `return 444`-style: deny by closing, no response
 
-    const host_header = req.header("host") orelse {
-        sendSimple(conn_fd, "400 Bad Request");
-        return;
-    };
-    const bal = router.route(hostOnly(host_header)) orelse return; // nginx `return 444`-style: deny by closing, no response
+        const keep_alive = forward(allocator, bal, conn_fd, peer, req, &buf, &start, end) catch |err| {
+            std.debug.print("proxy error: {any}\n", .{err});
+            return; // any error tears the whole connection down
+        };
+        if (!keep_alive) return;
 
-    forward(allocator, bal, conn_fd, peer, req, head_buf[req.consumed..len]) catch |err| {
-        std.debug.print("proxy error: {any}\n", .{err});
-    };
+        // Slide the unconsumed tail (pipelined next request) to the front for
+        // the next iteration.
+        const left = end - start;
+        std.mem.copyForwards(u8, buf[0..left], buf[start..end]);
+        start = 0;
+        end = left;
+    }
 }
 
 fn forward(
@@ -189,13 +226,15 @@ fn forward(
     client_fd: posix.fd_t,
     peer: posix.sockaddr.in6,
     req: Request,
-    leftover: []const u8,
-) !void {
+    buf: *[max_request_head]u8,
+    start: *usize,
+    end: usize,
+) !bool {
     _ = allocator; // not needed yet — everything here is fixed-size buffers
 
     if (req.chunked) {
         sendSimple(client_fd, "501 Not Implemented");
-        return;
+        return false;
     }
 
     const backend_addr = bal.pick();
@@ -204,6 +243,8 @@ fn forward(
 
     // Build the request head into one buffer, then write it in as few
     // syscalls as possible (writeAll below still loops for partial writes).
+    // We force Connection: close to the backend so it closes after one
+    // response — that EOF is what terminates the response relay below.
     var head: [max_request_head]u8 = undefined;
     var head_len: usize = 0;
     head_len += (try std.fmt.bufPrint(head[head_len..], "{s} {s} HTTP/1.1\r\n", .{ req.method, req.target })).len;
@@ -223,10 +264,13 @@ fn forward(
     if (req.content_length) |content_length| {
         var remaining = content_length;
 
-        const from_leftover = @min(leftover.len, remaining);
-        if (from_leftover > 0) {
-            try writeAll(backend_fd, leftover[0..from_leftover]);
-            remaining -= from_leftover;
+        // Consume body bytes that arrived in the buffer already (they follow
+        // the head with no gap), then stream the rest straight from the client.
+        const bufbod = @min(end - start.*, remaining);
+        if (bufbod > 0) {
+            try writeAll(backend_fd, buf.*[start.* .. start.* + bufbod]);
+            start.* += bufbod;
+            remaining -= bufbod;
         }
 
         var pump: [4096]u8 = undefined;
@@ -239,14 +283,69 @@ fn forward(
         }
     }
 
-    // Relay the response back verbatim; we don't need to parse it, just
-    // pump bytes until the backend closes (see file-level ponytail note).
+    return relayResponse(client_fd, backend_fd, req.keep_alive);
+}
+
+/// Relays the backend's response to the client but parses the response head
+/// enough to (a) rewrite the Connection header for the client hop and
+/// (b) decide whether the client connection can stay alive. The body is
+/// still streamed verbatim until the backend closes.
+///
+/// Keep-alive is only offered back to the client when the response declares
+/// framing (Content-Length or Transfer-Encoding) — otherwise the body is
+/// delimited by connection-close and there's no unambiguous point to start
+/// the next request on the same socket.
+fn relayResponse(client_fd: posix.fd_t, backend_fd: posix.fd_t, req_keep_alive: bool) !bool {
+    var hbuf: [max_response_head]u8 = undefined;
+    var hlen: usize = 0;
+    var term: ?usize = null;
+    while (term == null) {
+        if (hlen >= hbuf.len) return error.ResponseHeadTooLong;
+        const n = try posix.read(backend_fd, hbuf[hlen..]);
+        if (n == 0) return error.BackendClosedEarly;
+        hlen += n;
+        term = std.mem.indexOf(u8, hbuf[0..hlen], "\r\n\r\n");
+    }
+    const t = term.?;
+    const head = hbuf[0..t];
+
+    var has_framing = false;
+    var out: [max_response_head]u8 = undefined;
+    var out_len: usize = 0;
+
+    var lines = std.mem.splitSequence(u8, head, "\r\n");
+    const status_line = lines.next() orelse return error.BadResponseHead;
+    out_len += (try std.fmt.bufPrint(out[out_len..], "{s}\r\n", .{status_line})).len;
+    while (lines.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const name = std.mem.trim(u8, line[0..colon], " \t");
+        if (std.ascii.eqlIgnoreCase(name, "content-length")) has_framing = true;
+        if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) has_framing = true;
+        // Drop the Connection and Keep-Alive headers; we rewrite Connection
+        // for the client hop below. Everything else is relayed verbatim —
+        // the client still needs Content-Length / Transfer-Encoding to frame.
+        if (std.ascii.eqlIgnoreCase(name, "connection") or std.ascii.eqlIgnoreCase(name, "keep-alive")) continue;
+        out_len += (try std.fmt.bufPrint(out[out_len..], "{s}\r\n", .{line})).len;
+    }
+
+    const keep_alive = req_keep_alive and has_framing;
+    out_len += (try std.fmt.bufPrint(
+        out[out_len..],
+        "Connection: {s}\r\n\r\n",
+        .{if (keep_alive) "keep-alive" else "close"},
+    )).len;
+    try writeAll(client_fd, out[0..out_len]);
+
+    // Relay any body already read past the head, then drain the backend until
+    // it closes (it will — we asked it to via Connection: close).
+    if (t + 4 < hlen) try writeAll(client_fd, hbuf[t + 4 .. hlen]);
     var pump: [4096]u8 = undefined;
     while (true) {
         const n = try posix.read(backend_fd, &pump);
         if (n == 0) break;
         try writeAll(client_fd, pump[0..n]);
     }
+    return keep_alive;
 }
 
 /// Connects to an Io.net.IpAddress (already resolved by balancer.zig) over a

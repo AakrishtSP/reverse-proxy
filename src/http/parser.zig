@@ -25,6 +25,10 @@ pub const Request = struct {
     headers: []const Header,
     content_length: ?u64,
     chunked: bool,
+    /// Whether the client wants the connection kept alive after this request
+    /// (HTTP/1.1 keep-alive by default unless Connection: close; HTTP/1.0
+    /// needs an explicit Connection: keep-alive).
+    keep_alive: bool,
     consumed: usize, // bytes of `buf` this request occupied, incl. the trailing CRLFCRLF
 
     pub fn header(self: Request, name: []const u8) ?[]const u8 {
@@ -71,6 +75,8 @@ pub const Parser = struct {
         var count: usize = 0;
         var connection_tokens: [8][]const u8 = undefined;
         var connection_token_count: usize = 0;
+        var conn_close = false;
+        var conn_keep_alive = false;
         var content_length: ?u64 = null;
         var chunked = false;
 
@@ -103,6 +109,8 @@ pub const Parser = struct {
                         connection_tokens[connection_token_count] = trimmed;
                         connection_token_count += 1;
                     }
+                    if (std.ascii.eqlIgnoreCase(trimmed, "close")) conn_close = true;
+                    if (std.ascii.eqlIgnoreCase(trimmed, "keep-alive")) conn_keep_alive = true;
                 }
             }
 
@@ -128,6 +136,12 @@ pub const Parser = struct {
             .headers = self.header_buf[0..out],
             .content_length = content_length,
             .chunked = chunked,
+            .keep_alive = if (conn_close)
+                false // Connection: close always wins
+            else if (version == .http_1_0)
+                conn_keep_alive // explicit only
+            else
+                true, // HTTP/1.1 default
             .consumed = end + 4,
         };
     }
@@ -172,6 +186,7 @@ test "simple GET, no headers, no body" {
     try testing.expectEqual(@as(usize, 0), req.headers.len);
     try testing.expectEqual(@as(?u64, null), req.content_length);
     try testing.expectEqual(false, req.chunked);
+    try testing.expectEqual(true, req.keep_alive); // HTTP/1.1 defaults to keep-alive
     try testing.expectEqual(buf.len, req.consumed);
 }
 
@@ -198,6 +213,20 @@ test "chunked framing detected, Transfer-Encoding stripped as hop-by-hop" {
     try testing.expectEqual(true, req.chunked);
     try testing.expectEqual(@as(?u64, null), req.content_length);
     try testing.expectEqual(@as(?[]const u8, null), req.header("transfer-encoding"));
+}
+
+test "Connection: close disables keep-alive on HTTP/1.1" {
+    var p = Parser{};
+    const req = (try p.next("GET / HTTP/1.1\r\nConnection: close\r\n\r\n")).?;
+    try testing.expectEqual(false, req.keep_alive);
+}
+
+test "HTTP/1.0 defaults to close unless Connection: keep-alive" {
+    var p = Parser{};
+    const default_close = (try p.next("GET / HTTP/1.0\r\n\r\n")).?;
+    try testing.expectEqual(false, default_close.keep_alive);
+    const explicit = (try p.next("GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n")).?;
+    try testing.expectEqual(true, explicit.keep_alive);
 }
 
 test "Content-Length and Transfer-Encoding together is rejected" {
