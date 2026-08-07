@@ -4,55 +4,63 @@
 # JSON row per run appended to bench/results.jsonl. Each target is named after
 # its config file (basename, no extension).
 #
+# Every (target, concurrency, repeat) is benchmared under BOTH client
+# workloads unless -u is given:
+#   close   one-shot clients, wrk sends "Connection: close"
+#   open    keep-alive clients, wrk reuses connections
+# Each row is tagged with its workload in the "mode" column so the two are
+# never mixed. mode=upload (from -u) replaces both.
+#
 # Usage:
-#   bench/harness.sh [-c <config.zon>]... [-n] [repeats] [concurrencies...]
+#   bench/harness.sh [-c <config.zon>]... [-n] [-u] [repeats] [concurrencies...]
 #
 # Examples:
 #   bench/harness.sh -c config.zon
-#   bench/harness.sh -c bench/configs/pool-4.zon -c bench/configs/pool-16.zon
-#   bench/harness.sh -c bench/configs/pool-16.zon -n 3 50 100 200 500
+#   bench/harness.sh -c bench/configs/10-epoll-both.zon -n 3 50 100 200
 #
 #   -c <config.zon>  proxy config to bench (repeatable). stage = basename.
-#   -n               also bench an equivalent stock-nginx proxy (its own port ->
+#   -n              also bench an equivalent stock-nginx proxy (its own port ->
 #                    the same :8888 backend) so the proxy can be compared
-#                    against nginx's upstream as the http->backend hop.
-#   -u               use the chunked-upload workload (bench/upload-chunked.lua)
-#                    instead of GETs — exercises the chunked request-body path.
-#   repeats          wrk runs per (target, concurrency). Default 1.
+#                    against nginx's upstream as the http->backend hop. Starts
+#                    with a sanity check that nginx actually proxies (curl).
+#   -u              use the chunked-upload workload (bench/upload-chunked.lua)
+#                    instead of GETs (mode=upload, persistent) — exercises the
+#                    chunked request-body path.
+#   repeats          wrk runs per (target, concurrency, mode). Default 1.
 #   concurrency...   wrk -c values to sweep. Default 10 50 100 200 500 1000.
 #
-# By default wrk sends Connection: close (one-shot client connections, matching
-# the no-keepalive configs). Set WRK_KEEPALIVE=1 to let wrk keep client
-# connections open — required to actually exercise client/backend keep-alive
-# configs (client-only, both).
+# The C backend (bench/backend.c, an epoll HTTP/1.1 server returning "PONG!"
+# on :8888) is compiled and started once for the whole sweep. Each proxy config
+# is started on its own listen port (parsed from the config) and stopped after
+# its sweep. If no -c/-n is given, defaults to the repo's config.zon.
 #
-# The backend (nginx serving "ok\n" on :8888) is started once and kept up for
-# the whole sweep. Each proxy config is started on its own listen port (parsed
-# from the config) and stopped after its sweep. If no -c/-n is given, defaults
-# to the repo's config.zon.
+# Running output is a live per-(stage, mode, concurrency, repeat) line with its
+# req/s; the per-stage summary line prints the mean req/s across concurrency.
 #
 # One-time setup (also gives the analysis notebook a matching kernel):
 #   python3 -m venv .venv
 #   .venv/bin/pip install ipykernel pandas matplotlib
 #   .venv/bin/python -m ipykernel install --user --name reverse-proxy-bench
 #
-# ponytail: wrk is re-execed once per (concurrency, repeat) — no attempt to
-# batch or reuse a warm process. A cold first request per run is noise on a
+# ponytail: wrk is re-execed once per (concurrency, mode, repeat) — no attempt
+# to batch or reuse a warm process. A cold first request per run is noise on a
 # 30s test; not worth engineering around.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BENCH_DIR="$REPO_ROOT/bench"
 RESULTS="${HARNESS_RESULTS:-$BENCH_DIR/results.jsonl}"
-BIN="$REPO_ROOT/zig-out/bin/reverse_proxy"
 TMP="$BENCH_DIR/tmp"
-BACKEND_CONF="$TMP/backend-bench.conf"
+# Bench a dedicated ReleaseFast build so numbers reflect optimized code, never
+# a stray Debug build or /usr/bin. Built here, not reusing zig-out/bin.
+BIN="$TMP/reverse_proxy"
 NGINX_CONF="$TMP/nginx-proxy.conf"
 BACKEND_PID="$TMP/backend.pid"
 NGINX_PID="$TMP/nginx-proxy.pid"
 BACKEND_PORT=8888
 NGINX_PORT=8885
-DURATION="${HARNESS_DURATION:-30s}"
+BACKEND_BIN="$TMP/backend"
+DURATION="${HARNESS_DURATION:-10s}"
 WRK_THREADS=4
 : "${WRK_ARGS:=-L}"
 COMMIT="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
@@ -60,7 +68,6 @@ COMMIT="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown
 CONFIGS=()
 WANT_NGINX=0
 UPLOAD=0
-: "${WRK_KEEPALIVE:=0}"
 while getopts "c:nu" opt; do
   case "${opt}" in
     c) CONFIGS+=("${OPTARG}") ;;
@@ -75,49 +82,55 @@ shift || true
 CONCURRENCIES=("${@:-10 50 100 200 500 1000}")
 [ "${#CONCURRENCIES[@]}" -eq 1 ] && CONCURRENCIES=(${CONCURRENCIES[0]})
 
+MODES=(close open) && [ "$UPLOAD" -eq 1 ] && MODES=(upload)
+
 [ "${#CONFIGS[@]}" -eq 0 ] && [ "$WANT_NGINX" -eq 0 ] && CONFIGS=("$REPO_ROOT/config.zon")
 
-[ -x "$BIN" ] || { echo "missing $BIN — run: zig build" >&2; exit 1; }
-command -v nginx >/dev/null || { echo "nginx not on PATH" >&2; exit 1; }
+mkdir -p "$TMP"
+# ReleaseFast build for benching, copied into the temp dir so this never
+# depends on (or clobbers) a manual `zig build` artifact.
+if ! zig build -Doptimize=ReleaseFast >/dev/null 2>&1; then
+    echo "failed to build the proxy (ReleaseFast)" >&2
+    exit 1
+fi
+cp -f "$REPO_ROOT/zig-out/bin/reverse_proxy" "$BIN"
+[ -x "$BIN" ] || { echo "release build produced no binary at $BIN" >&2; exit 1; }
+command -v cc >/dev/null || { echo "cc not on PATH (needed to build the C backend)" >&2; exit 1; }
+if [ "$WANT_NGINX" -eq 1 ]; then
+    command -v nginx >/dev/null || { echo "nginx not on PATH (needed for -n)" >&2; exit 1; }
+fi
 VENV_PY="$REPO_ROOT/.venv/bin/python3"
 [ -x "$VENV_PY" ] || { echo "missing $VENV_PY — run: python3 -m venv .venv && .venv/bin/pip install ipykernel pandas matplotlib" >&2; exit 1; }
 
 mkdir -p "$TMP"
+cc -O2 -o "$BACKEND_BIN" "$BENCH_DIR/backend.c" || { echo "failed to build C backend" >&2; exit 1; }
 
 # --- parse_and_emit: wrk output file -> one JSON row -------------------------
+# Columns kept are exactly what the notebook consumes: identity (stage, kind,
+# mode, commit, concurrency), the latency percentiles, and req/sec.
 parse_and_emit() {
-    local out="$1" stage="$2" kind="$3" conn="$4" rep="$5"
-    "$VENV_PY" - "$out" "$stage" "$kind" "$COMMIT" "$conn" "$WRK_THREADS" "$DURATION" "$rep" <<'PY'
+    local out="$1" stage="$2" kind="$3" mode="$4" conn="$5" rep="$6"
+    "$VENV_PY" - "$out" "$stage" "$kind" "$mode" "$COMMIT" "$conn" "$WRK_THREADS" "$DURATION" "$rep" <<'PY'
 import re, sys, json, datetime
 text = open(sys.argv[1]).read()
 def num(pat, cast=float, default=None):
     m = re.search(pat, text)
     return cast(m.group(1)) if m else default
-def size_to_mb(s):
-    if s is None: return None
-    m = re.match(r"([\d.]+)([KMG]?)B", s)
-    if not m: return None
-    val, unit = float(m.group(1)), m.group(2)
-    return val * {"": 1/1024/1024, "K": 1/1024, "M": 1, "G": 1024}[unit]
 row = {
     "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
     "stage": sys.argv[2],
     "kind": sys.argv[3],
-    "commit": sys.argv[4],
-    "concurrency": int(sys.argv[5]),
-    "wrk_threads": int(sys.argv[6]),
-    "duration": sys.argv[7],
-    "repeat": int(sys.argv[8]),
+    "mode": sys.argv[4],
+    "commit": sys.argv[5],
+    "concurrency": int(sys.argv[6]),
+    "wrk_threads": int(sys.argv[7]),
+    "duration": sys.argv[8],
+    "repeat": int(sys.argv[9]),
     "req_per_sec": num(r"Requests/sec:\s+([\d.]+)"),
-    "transfer_per_sec_mb": size_to_mb(num(r"Transfer/sec:\s+([\d.]+[KMG]?B)", str)),
-    "latency_avg_ms": num(r"Latency\s+([\d.]+)ms"),
-    "latency_stdev_ms": num(r"Latency\s+[\d.]+ms\s+([\d.]+)ms"),
-    "latency_max_ms": num(r"Latency\s+[\d.]+ms\s+[\d.]+ms\s+([\d.]+)ms"),
     "p50_ms": num(r"50%\s+([\d.]+)ms"),
     "p75_ms": num(r"75%\s+([\d.]+)ms"),
     "p90_ms": num(r"90%\s+([\d.]+)ms"),
     "p99_ms": num(r"99%\s+([\d.]+)ms"),
-    "errors": num(r"Socket errors: connect (\d+)", int, 0),
 }
 print(json.dumps(row))
 PY
@@ -125,30 +138,52 @@ PY
 
 run_sweep() {  # stage kind port
     local stage="$1" kind="$2" port="$3"
+    # per-mode running sum/sum-of-squares/count for the closing avg+stdev line
+    local sum_open=0 ss_open=0 n_open=0
+    local sum_close=0 ss_close=0 n_close=0
+    local sum_upload=0 ss_upload=0 n_upload=0
+
     for conn in "${CONCURRENCIES[@]}"; do
-        for rep in $(seq 1 "$REPEATS"); do
-            echo "== stage=$stage conn=$conn rep=$rep/$REPEATS ==" >&2
-            local tmp; tmp="$(mktemp)"
-            local -a wcmd
-            if [ "$UPLOAD" -eq 1 ]; then
-                # chunked-upload workload: no Connection: close, so persistence
-                # follows wrk's own keep-alive.
-                wcmd=(wrk -t"$WRK_THREADS" -c "$conn" -d "$DURATION" "$WRK_ARGS"
-                      -s "$BENCH_DIR/upload-chunked.lua" "http://127.0.0.1:$port/")
-            elif [ "$WRK_KEEPALIVE" -eq 1 ]; then
-                wcmd=(wrk -t"$WRK_THREADS" -c "$conn" -d "$DURATION" "$WRK_ARGS"
-                      "http://127.0.0.1:$port/")
-            else
-                wcmd=(wrk -t"$WRK_THREADS" -c "$conn" -d "$DURATION" "$WRK_ARGS"
-                      -H "Connection: close" "http://127.0.0.1:$port/")
-            fi
-            if ! "${wcmd[@]}" > "$tmp" 2>&1; then
-                cat "$tmp" >&2; rm -f "$tmp"; continue
-            fi
-            parse_and_emit "$tmp" "$stage" "$kind" "$conn" "$rep" >> "$RESULTS"
-            rm -f "$tmp"
-            sleep 1   # let TIME_WAIT sockets drain before the next run
+        for wmode in "${MODES[@]}"; do
+            for rep in $(seq 1 "$REPEATS"); do
+                echo "== $stage mode=$wmode conn=$conn rep=$rep/$REPEATS ==" >&2
+                local tmp; tmp="$(mktemp)"
+                local -a wcmd
+                case "$wmode" in
+                    upload) wcmd=(wrk -t"$WRK_THREADS" -c "$conn" -d "$DURATION" "$WRK_ARGS"
+                                  -s "$BENCH_DIR/upload-chunked.lua" "http://127.0.0.1:$port/") ;;
+                    open)   wcmd=(wrk -t"$WRK_THREADS" -c "$conn" -d "$DURATION" "$WRK_ARGS"
+                                  "http://127.0.0.1:$port/") ;;
+                    close)  wcmd=(wrk -t"$WRK_THREADS" -c "$conn" -d "$DURATION" "$WRK_ARGS"
+                                  -H "Connection: close" "http://127.0.0.1:$port/") ;;
+                esac
+                if ! "${wcmd[@]}" > "$tmp" 2>&1; then
+                    cat "$tmp" >&2; rm -f "$tmp"; continue
+                fi
+                parse_and_emit "$tmp" "$stage" "$kind" "$wmode" "$conn" "$rep" | tee -a "$RESULTS"
+                local rps; rps="$(grep -oP 'Requests/sec:\s+\K[\d.]+' "$tmp" | head -1)"
+                printf '  %-20s mode=%-6s conn=%-4d rep=%d  ->  %s req/s\n' \
+                    "$stage" "$wmode" "$conn" "$rep" "${rps:-n/a}"
+                case "$wmode" in
+                    open)   sum_open=$(awk "BEGIN{print $sum_open+$rps}");   ss_open=$(awk "BEGIN{print $ss_open+$rps*$rps}");   n_open=$((n_open+1)) ;;
+                    close)  sum_close=$(awk "BEGIN{print $sum_close+$rps}"); ss_close=$(awk "BEGIN{print $ss_close+$rps*$rps}"); n_close=$((n_close+1)) ;;
+                    upload) sum_upload=$(awk "BEGIN{print $sum_upload+$rps}"); ss_upload=$(awk "BEGIN{print $ss_upload+$rps*$rps}"); n_upload=$((n_upload+1)) ;;
+                esac
+                rm -f "$tmp"
+                sleep 1   # let TIME_WAIT sockets drain before the next run
+            done
         done
+    done
+
+    # closing summary: mean + stdev req/s per mode, so a long sweep ends with
+    # a readable average instead of just the last row.
+    for m in open close upload; do
+        eval "local n=\$n_$m sum=\$sum_$m ss=\$ss_$m"
+        [ "$n" -gt 0 ] || continue
+        local mean stdev
+        mean="$(awk "BEGIN{printf \"%.0f\", $sum/$n}")"
+        stdev="$(awk "BEGIN{printf \"%.0f\", ($n>1)?sqrt(($ss-$sum*$sum/$n)/$n):0}")"
+        printf '>> %s mode=%-6s avg %s req/s  (sd %s, %d runs)\n' "$stage" "$m" "$mean" "$stdev" "$n"
     done
 }
 
@@ -161,29 +196,71 @@ wait_port() {
     return 1
 }
 
-stop_backend() { [ -f "$BACKEND_PID" ] && nginx -c "$BACKEND_CONF" -s stop 2>/dev/null || true; }
+stop_backend() {
+    [ -f "$BACKEND_PID" ] || return 0
+    kill "$(cat "$BACKEND_PID")" 2>/dev/null || true
+    wait "$(cat "$BACKEND_PID")" 2>/dev/null || true
+    rm -f "$BACKEND_PID"
+}
 trap stop_backend EXIT
 
-cat > "$BACKEND_CONF" <<EOF
-pid $BACKEND_PID;
-error_log $TMP/backend-error.log;
-events { worker_connections 1024; }
-http {
-    access_log off;
-    client_body_temp_path $TMP/backend-body;
-    proxy_temp_path       $TMP/backend-proxy;
-    fastcgi_temp_path     $TMP/backend-fastcgi;
-    uwsgi_temp_path       $TMP/backend-uwsgi;
-    scgi_temp_path        $TMP/backend-scgi;
-    server { listen $BACKEND_PORT; location / { return 200 "ok\n"; } }
-}
-EOF
 stop_backend
-nginx -c "$BACKEND_CONF"
+"$BACKEND_BIN" > "$TMP/backend.log" 2>&1 &
+echo $! > "$BACKEND_PID"
+wait_port "$BACKEND_PORT" || {
+    echo "C backend failed to listen on :$BACKEND_PORT" >&2
+    cat "$TMP/backend.log" >&2
+    stop_backend
+    exit 1
+}
 echo "backend up on :$BACKEND_PORT" >&2
 sleep 0.3
 
 count=0
+if [ "$WANT_NGINX" -eq 1 ]; then
+    # stock-nginx proxy config: own listen port -> the same :8888 backend
+    write_nginx_conf() {
+        cat > "$NGINX_CONF" <<EOF
+pid $NGINX_PID;
+error_log $TMP/nginx-proxy-error.log;
+worker_processes auto;
+events { worker_connections 1024; }
+http {
+    access_log off;
+    client_body_temp_path $TMP/nginx-body;
+    proxy_temp_path       $TMP/nginx-ptmp;
+    fastcgi_temp_path     $TMP/nginx-fastcgi;
+    uwsgi_temp_path       $TMP/nginx-uwsgi;
+    scgi_temp_path        $TMP/nginx-scgi;
+    server {
+        listen $NGINX_PORT;
+        location / { proxy_pass http://127.0.0.1:$BACKEND_PORT; }
+    }
+}
+EOF
+    }
+    start_nginx() { write_nginx_conf; nginx -c "$NGINX_CONF"; sleep 0.3; }
+    stop_nginx() { nginx -c "$NGINX_CONF" -s stop 2>/dev/null || true; }
+    trap 'stop_nginx; stop_backend' EXIT
+
+    write_nginx_conf
+    nginx -t -c "$NGINX_CONF" >/dev/null 2>&1 || { echo "nginx: invalid $NGINX_CONF" >&2; exit 1; }
+    # start nginx ONCE and verify it actually proxies, then leave it up for its
+    # sweep at the end (nginx sits idle while the proxy configs are benched).
+    start_nginx
+    wait_port "$NGINX_PORT" || {
+        echo "nginx failed to listen on :$NGINX_PORT" >&2
+        cat "$TMP/nginx-proxy-error.log" >&2 2>/dev/null || true
+        stop_nginx; stop_backend; exit 1
+    }
+    if [ "$(curl -s "http://127.0.0.1:$NGINX_PORT/")" != "PONG!" ]; then
+        echo "nginx baseline sanity check FAILED (expected PONG! from :$NGINX_PORT)" >&2
+        cat "$TMP/nginx-proxy-error.log" >&2 2>/dev/null || true
+        stop_nginx; stop_backend; exit 1
+    fi
+    echo "nginx baseline OK (PONG! through :$NGINX_PORT)" >&2
+fi
+
 for cfg in "${CONFIGS[@]}"; do
     [ -f "$cfg" ] || { echo "config not found: $cfg" >&2; exit 1; }
     [[ "$cfg" == /* ]] || cfg="$REPO_ROOT/$cfg"
@@ -208,32 +285,8 @@ for cfg in "${CONFIGS[@]}"; do
 done
 
 if [ "$WANT_NGINX" -eq 1 ]; then
-    stop_nginx_proxy() { [ -f "$NGINX_PID" ] && nginx -c "$NGINX_CONF" -s stop 2>/dev/null || true; }
-    trap 'stop_nginx_proxy; stop_backend' EXIT
-
-    cat > "$NGINX_CONF" <<EOF
-pid $NGINX_PID;
-error_log $TMP/nginx-proxy-error.log;
-worker_processes auto;
-events { worker_connections 1024; }
-http {
-    access_log off;
-    client_body_temp_path $TMP/nginx-body;
-    proxy_temp_path       $TMP/nginx-ptmp;
-    fastcgi_temp_path     $TMP/nginx-fastcgi;
-    uwsgi_temp_path       $TMP/nginx-uwsgi;
-    scgi_temp_path        $TMP/nginx-scgi;
-    server {
-        listen $NGINX_PORT;
-        location / { proxy_pass http://127.0.0.1:$BACKEND_PORT; }
-    }
-}
-EOF
-    stop_nginx_proxy
-    nginx -c "$NGINX_CONF"
-    sleep 0.3
     run_sweep "nginx" "nginx" "$NGINX_PORT"
-    stop_nginx_proxy
+    stop_nginx
     count=$((count + 1))
 fi
 

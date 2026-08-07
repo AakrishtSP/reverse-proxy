@@ -1,17 +1,26 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Config = @import("config.zig");
 const StdIo = @import("stdio.zig").StdIo;
 const Router = @import("router.zig");
 const Server = @import("threaded/server.zig");
+const EpollServer = @import("epoll/server.zig");
+const logmod = @import("log.zig");
 pub fn main(init: std.process.Init) !void {
     var stdio = StdIo.init(init);
     var gpa: std.heap.DebugAllocator(.{}) = .init;
+    var gpa_allocator: std.mem.Allocator = undefined;
     defer {
-        const status = gpa.deinit();
-        if (status == .leak) std.debug.print("Warning: Memory leak found\n", .{});
+        if (builtin.mode == .Debug) {
+            const status = gpa.deinit();
+            if (status == .leak) std.debug.print("Warning: Memory leak found\n", .{});
+        }
     }
 
-    const allocator = gpa.allocator();
+    const allocator = if (builtin.mode == .Debug) blk: {
+        gpa_allocator = gpa.allocator();
+        break :blk gpa_allocator;
+    } else std.heap.smp_allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const arena_allocator = arena.allocator();
@@ -54,12 +63,14 @@ pub fn main(init: std.process.Init) !void {
     try Config.printConfig(config, &stdio);
 
     var router = try Router.build(init.io, arena_allocator, config);
+    logmod.logger.start();
+    defer logmod.logger.deinit();
     switch (config.server.kind) {
         .threaded => try Server.run(arena_allocator, &router, config.listen, config.server.threaded),
-        .epoll => {
-            try stdio.eprintln("server backend `epoll` is not implemented yet; use `.threaded`", .{});
-            return error.BackendNotImplemented;
-        },
+        // epoll preallocates a fixed pool of Conn slots (opts.max_connections)
+        // and recycles them, so it needs no per-connection allocations at all;
+        // the freeing allocator is still used for the backend-socket pool.
+        .epoll => try EpollServer.run(allocator, &router, config.listen, config.server.epoll),
     }
 }
 

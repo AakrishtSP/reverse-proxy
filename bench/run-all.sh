@@ -2,33 +2,38 @@
 # Runs the harness across every config in bench/configs/ in one go.
 #
 # Usage:
-#   bench/run-all.sh [-n] [-u] [-k] [repeats] [concurrencies...]
+#   bench/run-all.sh [-n] [-u] [repeats] [concurrencies...]
 #
 #   -n   also bench the equivalent stock-nginx proxy (passed through to harness)
 #   -u   chunked-upload workload instead of GETs (passed through to harness)
-#   -k   keep-alive client workload (WRK_KEEPALIVE=1). Makes the client/both/
-#        backend-only keep-alive configs meaningful; without it every request
-#        is one-shot and those configs all measure the same as no-keepalive.
 #   repeats, concurrency...  forwarded to the harness unchanged.
 #
-# Without -k, the standard Connection: close sweep runs (the no-keepalive case).
+# Every config is benched under BOTH workloads (mode=close one-shot and
+# mode=open keep-alive) because the harness now always runs both; see
+# bench/harness.sh. The two are kept apart by each row's "mode" column.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIG_DIR="$REPO_ROOT/bench/configs"
+RESULTS="$REPO_ROOT/bench/results.jsonl"
 
 WANT_NGINX=0
 UPLOAD=0
-KEEPALIVE=0
-while getopts "nuk" opt; do
+while getopts "nu" opt; do
   case "${opt}" in
     n) WANT_NGINX=1 ;;
     u) UPLOAD=1 ;;
-    k) KEEPALIVE=1 ;;
-    *) echo "usage: $0 [-n] [-u] [-k] [repeats] [concurrencies...]" >&2; exit 2 ;;
+    *) echo "usage: $0 [-n] [-u] [repeats] [concurrencies...]" >&2; exit 2 ;;
   esac
 done
 shift $((OPTIND - 1))
+
+# A full sweep is a self-contained dataset (the notebook's waterfall compares
+# row-to-row), so start fresh — but archive the previous results, never delete.
+if [ -s "$RESULTS" ]; then
+    mv "$RESULTS" "$RESULTS.$(date +%Y%m%d-%H%M%S).bak"
+    echo "archived previous results to $RESULTS.bak" >&2
+fi
 
 shopt -s nullglob
 CONFIGS=("$CONFIG_DIR"/*.zon)
@@ -39,6 +44,5 @@ ARGS=()
 for cfg in "${CONFIGS[@]}"; do ARGS+=(-c "$cfg"); done
 [ "$WANT_NGINX" -eq 1 ] && ARGS+=(-n)
 [ "$UPLOAD" -eq 1 ] && ARGS+=(-u)
-[ "$KEEPALIVE" -eq 1 ] && export WRK_KEEPALIVE=1
 
 exec "$REPO_ROOT/bench/harness.sh" "${ARGS[@]}" "$@"

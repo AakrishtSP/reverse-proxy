@@ -54,6 +54,7 @@ const http = @import("../http/parser.zig");
 const Parser = http.Parser;
 const Request = http.Request;
 const Chunked = @import("../http/chunked.zig");
+const util = @import("../http/util.zig");
 
 const RouterMod = @import("../router.zig");
 const Router = RouterMod.Router;
@@ -63,6 +64,7 @@ const max_request_head = 8192;
 const max_response_head = 8192;
 
 const ThreadedConfig = @import("../config.zig").ThreadedConfig;
+const log = @import("../log.zig");
 
 /// std.posix.{socket,bind,listen,accept,connect} were removed in 0.16
 /// (moved into std.Io.net's vtable). We already can't route through
@@ -155,7 +157,7 @@ pub fn run(allocator: std.mem.Allocator, router: *Router, port: u16, opts: Threa
     // besides pull its share of connections.
     for (0..opts.pool_threads - 1) |_| {
         _ = std.Thread.spawn(.{}, workerLoop, .{ allocator, router, listen_fd, opts }) catch |err| {
-            std.debug.print("thread spawn failed: {any}\n", .{err});
+            std.debug.print("thread spawn failed: {any}\n", .{err}); // ponytail: not hot path (once per pool), keep direct
         };
     }
     workerLoop(allocator, router, listen_fd, opts);
@@ -166,7 +168,7 @@ fn workerLoop(allocator: std.mem.Allocator, router: *Router, listen_fd: posix.fd
         var peer: posix.sockaddr.in6 = undefined;
         var peer_len: posix.socklen_t = @sizeOf(posix.sockaddr.in6);
         const conn_fd = sysAccept4(listen_fd, @ptrCast(&peer), &peer_len, posix.SOCK.CLOEXEC) catch |err| {
-            std.debug.print("accept failed: {any}\n", .{err});
+            log.fmt("accept failed: {any}", .{err});
             continue;
         };
         enableTcpNoDelay(conn_fd);
@@ -208,7 +210,7 @@ fn handleConnection(allocator: std.mem.Allocator, router: *Router, conn_fd: posi
                 return;
             }
             const n = posix.read(conn_fd, buf[end..]) catch |err| {
-                std.debug.print("read error: {any}\n", .{err});
+                log.fmt("read error: {any}", .{err});
                 return;
             };
             if (n == 0) return; // peer closed
@@ -221,7 +223,7 @@ fn handleConnection(allocator: std.mem.Allocator, router: *Router, conn_fd: posi
             sendSimple(conn_fd, "400 Bad Request");
             return;
         };
-        const bal = router.route(hostOnly(host_header)) orelse return; // nginx `return 444`-style: deny by closing, no response
+        const bal = router.route(util.hostOnly(host_header)) orelse return; // nginx `return 444`-style: deny by closing, no response
 
         // Chunked request bodies are relayable only when the config enables
         // that path; otherwise reject before touching the backend.
@@ -231,7 +233,7 @@ fn handleConnection(allocator: std.mem.Allocator, router: *Router, conn_fd: posi
         }
 
         const keep_alive = forward(allocator, bal, conn_fd, peer, req, &buf, &start, &end, &backend, opts) catch |err| {
-            std.debug.print("proxy error: {any}\n", .{err});
+            log.fmt("proxy error: {any}", .{err});
             return; // any error tears the whole connection down
         };
         // Close after this response when the client asked to, the framing
@@ -283,7 +285,7 @@ fn forward(
         if (std.ascii.eqlIgnoreCase(h.name, "x-forwarded-for")) continue;
         head_len += (try std.fmt.bufPrint(head[head_len..], "{s}: {s}\r\n", .{ h.name, h.value })).len;
     }
-    head_len = try writeForwardedFor(&head, head_len, peer.addr);
+    head_len = try util.writeForwardedFor(&head, head_len, peer.addr);
     head_len += (try std.fmt.bufPrint(head[head_len..], "Via: 1.1 reverse-proxy\r\n", .{})).len;
     // The parser strips Transfer-Encoding as hop-by-hop, but a chunked body
     // must be announced to the backend or its bytes won't make sense to it.
@@ -588,61 +590,4 @@ fn sendSimple(fd: posix.fd_t, status: []const u8) void {
         .{status},
     ) catch return;
     writeAll(fd, msg) catch {};
-}
-
-/// Writes the X-Forwarded-For header for a raw v6 sockaddr's 16-byte
-/// address, unmapping v4-mapped addresses (::ffff:a.b.c.d) back to plain
-/// dotted-quad since that's what downstream log parsers expect from a v4
-/// client — the listener being dual-stack shouldn't leak into the header
-/// shape. Returns the new head_len.
-fn writeForwardedFor(head: []u8, head_len: usize, addr: [16]u8) !usize {
-    const is_v4_mapped = std.mem.eql(u8, addr[0..10], &[_]u8{0} ** 10) and
-        addr[10] == 0xff and addr[11] == 0xff;
-    if (is_v4_mapped) {
-        return head_len + (try std.fmt.bufPrint(
-            head[head_len..],
-            "X-Forwarded-For: {d}.{d}.{d}.{d}\r\n",
-            .{ addr[12], addr[13], addr[14], addr[15] },
-        )).len;
-    }
-    // ponytail: expanded form only (no :: compression, no leading-zero
-    // trimming) — correct but ugly. Fine for a header nothing parses
-    // strictly. Upgrade path: std.net.Ip6Address's formatter if/once it's
-    // stable again post-0.16 std.Io churn.
-    const groups: [8]u16 = @bitCast(addr);
-    return head_len + (try std.fmt.bufPrint(
-        head[head_len..],
-        "X-Forwarded-For: {x}:{x}:{x}:{x}:{x}:{x}:{x}:{x}\r\n",
-        .{
-            std.mem.bigToNative(u16, groups[0]), std.mem.bigToNative(u16, groups[1]),
-            std.mem.bigToNative(u16, groups[2]), std.mem.bigToNative(u16, groups[3]),
-            std.mem.bigToNative(u16, groups[4]), std.mem.bigToNative(u16, groups[5]),
-            std.mem.bigToNative(u16, groups[6]), std.mem.bigToNative(u16, groups[7]),
-        },
-    )).len;
-}
-
-/// Strips a ":port" suffix (or keeps a "[ipv6]" literal intact) so the
-/// result matches what Router.route expects.
-fn hostOnly(h: []const u8) []const u8 {
-    if (h.len > 0 and h[0] == '[') {
-        const end = std.mem.indexOfScalar(u8, h, ']') orelse return h;
-        return h[0 .. end + 1];
-    }
-    const colon = std.mem.lastIndexOfScalar(u8, h, ':') orelse return h;
-    return h[0..colon];
-}
-
-test "v4-mapped address unmaps to dotted-quad in X-Forwarded-For" {
-    var head: [128]u8 = undefined;
-    const mapped: [16]u8 = [_]u8{0} ** 10 ++ [_]u8{ 0xff, 0xff, 10, 0, 0, 1 };
-    const len = try writeForwardedFor(&head, 0, mapped);
-    try std.testing.expectEqualStrings("X-Forwarded-For: 10.0.0.1\r\n", head[0..len]);
-}
-
-test "real v6 address stays expanded hex, not misread as v4" {
-    var head: [128]u8 = undefined;
-    const real_v6: [16]u8 = [_]u8{ 0x20, 0x01 } ++ [_]u8{0} ** 14;
-    const len = try writeForwardedFor(&head, 0, real_v6);
-    try std.testing.expect(std.mem.startsWith(u8, head[0..len], "X-Forwarded-For: 2001:"));
 }
