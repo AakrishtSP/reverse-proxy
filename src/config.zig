@@ -50,14 +50,30 @@ pub const EpollConfig = struct {
     loops: usize = 1,
 };
 
+pub const IoUringConfig = struct {
+    /// Keep the client connection alive across requests when the client asks
+    /// for it and the response framing allows it.
+    client_keepalive: bool = true,
+    /// Keep the backend connection alive across requests. Minimal first cut
+    /// always asks the backend to close and connects fresh per request, so this
+    /// is accepted but not yet used.
+    backend_keepalive: bool = true,
+    /// Relay chunked (Transfer-Encoding: chunked) request bodies. The minimal
+    /// io_uring server rejects chunked requests with 415.
+    chunked_requests: bool = false,
+    /// io_uring submission/completion queue depth (power of two).
+    entries: u16 = 4096,
+};
+
 pub const ServerConfig = struct {
     /// Which serving backend to use. `threaded` (pool of blocking worker
-    /// threads, per-client backend reuse) and `epoll` (single-threaded event
-    /// loop, shared backend connection pool) are both implemented. `epoll` is
-    /// the default and fastest.
-    kind: enum { threaded, epoll } = .epoll,
+    /// threads, per-client backend reuse), `epoll` (event loop with optional
+    /// SO_REUSEPORT multi-loop, shared backend connection pool), and `io_uring`
+    /// (single-threaded ring) are all implemented. `epoll` is the default.
+    kind: enum { threaded, epoll, io_uring } = .epoll,
     threaded: ThreadedConfig = .{},
     epoll: EpollConfig = .{},
+    io_uring: IoUringConfig = .{},
 };
 
 pub const Config = struct {
@@ -79,6 +95,12 @@ const default_config_zon =
     \\            .pool_size = 100,
     \\            .max_connections = 2048,
     \\            .loops = 1,
+    \\        },
+    \\        .io_uring = .{
+    \\            .client_keepalive = true,
+    \\            .backend_keepalive = true,
+    \\            .chunked_requests = false,
+    \\            .entries = 4096,
     \\        },
     \\    },
     \\    .vhosts = .{},
@@ -151,7 +173,7 @@ pub fn printConfig(config: Config, stdio: *StdIo) !void {
     try stdio.println("\t.server: .{{", .{});
     try stdio.println("\t\t.kind: .{s},", .{@tagName(config.server.kind)});
     try stdio.println(
-        "\t\t.threaded: .{{.pool_threads: {d}, .client_keepalive: {}, .backend_keepalive: {}, .chunked_requests: {}}},\n\t\t.epoll: .{{.client_keepalive: {}, .backend_keepalive: {}, .chunked_requests: {}, .pool_size: {d}, .max_connections: {d}, .loops: {d}}},\n\t}},\n\t.vhosts: ",
+        "\t\t.threaded: .{{.pool_threads: {d}, .client_keepalive: {}, .backend_keepalive: {}, .chunked_requests: {}}},\n\t\t.epoll: .{{.client_keepalive: {}, .backend_keepalive: {}, .chunked_requests: {}, .pool_size: {d}, .max_connections: {d}, .loops: {d}}},\n\t\t.io_uring: .{{.client_keepalive: {}, .backend_keepalive: {}, .chunked_requests: {}, .entries: {d}}},\n\t}},\n\t.vhosts: ",
         .{
             config.server.threaded.pool_threads,
             config.server.threaded.client_keepalive,
@@ -163,6 +185,10 @@ pub fn printConfig(config: Config, stdio: *StdIo) !void {
             config.server.epoll.pool_size,
             config.server.epoll.max_connections,
             config.server.epoll.loops,
+            config.server.io_uring.client_keepalive,
+            config.server.io_uring.backend_keepalive,
+            config.server.io_uring.chunked_requests,
+            config.server.io_uring.entries,
         },
     );
     try stdio.println("\t.{{", .{});

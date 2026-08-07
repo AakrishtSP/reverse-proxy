@@ -27,3 +27,4 @@ bench/*
 !bench/results.jsonl
 !bench/configs/
 !bench/upload-chunked.lua
+!bench/backend.c

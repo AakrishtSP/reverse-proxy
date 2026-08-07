@@ -5,6 +5,7 @@ const StdIo = @import("stdio.zig").StdIo;
 const Router = @import("router.zig");
 const Server = @import("threaded/server.zig");
 const EpollServer = @import("epoll/server.zig");
+const IoUringServer = @import("io_uring/server.zig");
 const logmod = @import("log.zig");
 pub fn main(init: std.process.Init) !void {
     var stdio = StdIo.init(init);
@@ -71,6 +72,7 @@ pub fn main(init: std.process.Init) !void {
         // and recycles them, so it needs no per-connection allocations at all;
         // the freeing allocator is still used for the backend-socket pool.
         .epoll => try EpollServer.run(allocator, &router, config.listen, config.server.epoll),
+        .io_uring => try IoUringServer.run(allocator, &router, config.listen, config.server.io_uring),
     }
 }
 
