@@ -137,3 +137,46 @@ python3 -m venv .venv
 Then open `analysis/bench_analysis.ipynb` (kernel: `reverse-proxy-bench`) to
 chart throughput-vs-concurrency per stage, latency percentiles, an improvement
 waterfall across stages, and the threaded-vs-epoll-vs-io_uring comparison.
+
+## Findings
+
+Gotchas and counter-intuitive measurements collected while benching (one
+machine, ReleaseFast, wrk). A single `wrk` run is noisy — the pairs below are
+the interesting shapes; verify any claim with a `run-all` sweep before trusting
+it.
+
+- **Direct backend can look *slower* than through the proxy (close mode).**
+  Same load: `wrk -H "Connection: close"` directly at `:8888` measured
+  ~470k req/s while the same read through the io_uring proxy at `:8880`
+  measured ~920k. The `backend.c` fixture answers `Connection: keep-alive`
+  unconditionally, so a close-mode client's sockets stay open until it closes
+  them and wrk can't recycle its 50 connections fast; the proxy answers the
+  client `Connection: close` and tears down immediately, so wrk recycles
+  instantly. The backend isn't slow — it does ~820k at c800 — the *direct*
+  number is the close/connection-recycle path, not the backend.
+- **The backend is usually the wall, and it moved when we multi-threaded it.**
+  The original single-threaded `backend.c` capped at ~165-180k in every mode
+  (one core), silently throttling whatever proxy sat in front of it. After
+  one `SO_REUSEPORT` epoll loop per CPU it reached ~470-820k. Re-check the
+  backend whenever a proxy "improvement" doesn't move end-to-end numbers.
+- **The single-threaded io_uring loop is only fast at low concurrency.**
+  Through the proxy: ~370k open / ~830k close at `c50`, collapsing to ~190k
+  at `c500`-`c1000` (both modes). One core + one in-flight op per connection
+  saturates under `conn` load. That's the argument for a `SO_REUSEPORT`
+  multi-loop io_uring (mirroring the epoll `loops` work).
+- **`open` (keep-alive) is CPU-bound; `close` is connection-setup-bound.**
+  threaded (16 threads) beats single-loop epoll on `open` (~150k vs ~35k),
+  but `close` favors epoll. "Which is faster" flips with the mode, so we
+  benchmark and report both separately, per concurrency.
+- **`wrk -L` latency percentiles are unit-lagged.** Sub-millisecond values
+  print as `108.00us`; the harness normalizes `us`/`ms`/`s` → ms. Old rows
+  with a `null` `p*_ms` are a parse artifact, not a missing read.
+- **A preallocated ConnPool looks like a leak, but isn't.** 2048 × 48KB
+  slots reserve ~100MB virtual address space while RSS stays ~15MB, because
+  pages are demand-allocated on first touch. Low RSS vs large VSZ is by
+  design.
+- **(dev) `linux.IoUring` trips the naive "copy the struct" pattern.** Its
+  submit-queue tail lives in the struct's own field, not the shared mmap —
+  queueing an op on a by-value copy and submitting on the original silently
+  submits 0 and the ring never wakes. Queue and submit through one and the
+  same instance.
