@@ -28,9 +28,10 @@
 //!     (Content-Length or Transfer-Encoding) we can relay deterministically.
 //!     Responses without framing (delimited by connection-close) force the
 //!     client connection shut, since we can't know where one ends.
-//!   - Content-Length request bodies only. Chunked request bodies are refused
-//!     with 501 — forwarding them correctly needs http/chunked.zig's boundary
-//!     scanner (not built yet) to know where the body ends without decoding it.
+//!   - Content-Length and chunked (Transfer-Encoding) request bodies are both
+//!     relayed. Chunked bodies stream through http/chunked.zig's framing
+//!     scanner — forwarded verbatim, never decoded or buffered — so a large
+//!     upload doesn't cost memory and the body boundary is known for keep-alive.
 //!   - One backend connection per request: we always send the backend
 //!     "Connection: close" and relay its response until the backend closes.
 //!     ponytail: a misbehaving backend that ignores Connection: close and
@@ -50,6 +51,7 @@ const net = std.Io.net; // type-only: IpAddress from balancer.zig, no I/O calls
 const http = @import("../http/parser.zig");
 const Parser = http.Parser;
 const Request = http.Request;
+const Chunked = @import("../http/chunked.zig");
 
 const RouterMod = @import("../router.zig");
 const Router = RouterMod.Router;
@@ -205,7 +207,7 @@ fn handleConnection(allocator: std.mem.Allocator, router: *Router, conn_fd: posi
         };
         const bal = router.route(hostOnly(host_header)) orelse return; // nginx `return 444`-style: deny by closing, no response
 
-        const keep_alive = forward(allocator, bal, conn_fd, peer, req, &buf, &start, end) catch |err| {
+        const keep_alive = forward(allocator, bal, conn_fd, peer, req, &buf, &start, &end) catch |err| {
             std.debug.print("proxy error: {any}\n", .{err});
             return; // any error tears the whole connection down
         };
@@ -228,14 +230,9 @@ fn forward(
     req: Request,
     buf: *[max_request_head]u8,
     start: *usize,
-    end: usize,
+    end: *usize,
 ) !bool {
     _ = allocator; // not needed yet — everything here is fixed-size buffers
-
-    if (req.chunked) {
-        sendSimple(client_fd, "501 Not Implemented");
-        return false;
-    }
 
     const backend_addr = bal.pick();
     const backend_fd = try connectTo(backend_addr);
@@ -257,16 +254,24 @@ fn forward(
     }
     head_len = try writeForwardedFor(&head, head_len, peer.addr);
     head_len += (try std.fmt.bufPrint(head[head_len..], "Via: 1.1 reverse-proxy\r\n", .{})).len;
+    // The parser strips Transfer-Encoding as hop-by-hop, but a chunked body
+    // must be announced to the backend or its bytes won't make sense to it.
+    // Content-Length bodies never carry TE, so the two are mutually exclusive.
+    if (req.chunked) {
+        head_len += (try std.fmt.bufPrint(head[head_len..], "Transfer-Encoding: chunked\r\n", .{})).len;
+    }
     head_len += (try std.fmt.bufPrint(head[head_len..], "Connection: close\r\n\r\n", .{})).len;
 
     try writeAll(backend_fd, head[0..head_len]);
 
-    if (req.content_length) |content_length| {
+    if (req.chunked) {
+        try forwardChunkedBody(client_fd, backend_fd, buf, start, end);
+    } else if (req.content_length) |content_length| {
         var remaining = content_length;
 
         // Consume body bytes that arrived in the buffer already (they follow
         // the head with no gap), then stream the rest straight from the client.
-        const bufbod = @min(end - start.*, remaining);
+        const bufbod = @min(end.* - start.*, remaining);
         if (bufbod > 0) {
             try writeAll(backend_fd, buf.*[start.* .. start.* + bufbod]);
             start.* += bufbod;
@@ -284,6 +289,34 @@ fn forward(
     }
 
     return relayResponse(client_fd, backend_fd, req.keep_alive);
+}
+
+/// Streams a chunked request body to the backend verbatim while scanning for
+/// its end, so only the terminal "0\r\n[trailers]\r\n" is consumed — bytes
+/// beyond it (a pipelined next request) stay in the [start..end) window for
+/// the keep-alive loop.
+fn forwardChunkedBody(
+    client_fd: posix.fd_t,
+    backend_fd: posix.fd_t,
+    buf: *[max_request_head]u8,
+    start: *usize,
+    end: *usize,
+) !void {
+    var scan: Chunked.Scanner = .{};
+    while (!scan.done) {
+        if (start.* == end.*) {
+            // Buffered body consumed; compact (start sits at end so the whole
+            // window is free) and read more from the client.
+            start.* = 0;
+            end.* = 0;
+            const n = try posix.read(client_fd, buf.*[0..]);
+            if (n == 0) return error.ClientClosedMidChunked;
+            end.* = n;
+        }
+        const res = try scan.feed(buf.*[start.*..end.*]);
+        try writeAll(backend_fd, buf.*[start.* .. start.* + res.consumed]);
+        start.* += res.consumed;
+    }
 }
 
 /// Relays the backend's response to the client but parses the response head
