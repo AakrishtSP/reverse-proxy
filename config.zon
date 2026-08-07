@@ -1,5 +1,14 @@
 .{
     .listen = 8880,
+    .server = .{
+        .kind = .epoll,
+        .epoll = .{
+            .client_keepalive = true,
+            .backend_keepalive = true,
+            .chunked_requests = true,
+            .pool_size = 100,
+        },
+    },
     .vhosts = .{
         .{
             .hostnames = .{"jellyfin.internal"},

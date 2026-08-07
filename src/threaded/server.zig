@@ -28,15 +28,18 @@
 //!     (Content-Length or Transfer-Encoding) we can relay deterministically.
 //!     Responses without framing (delimited by connection-close) force the
 //!     client connection shut, since we can't know where one ends.
-//!   - Content-Length request bodies only. Chunked request bodies are refused
-//!     with 501 — forwarding them correctly needs http/chunked.zig's boundary
-//!     scanner (not built yet) to know where the body ends without decoding it.
-//!   - One backend connection per request: we always send the backend
-//!     "Connection: close" and relay its response until the backend closes.
-//!     ponytail: a misbehaving backend that ignores Connection: close and
-//!     keeps the socket open would hang this relay until the OS times it out.
-//!     Upgrade path: keep backend connections pooled and/or parse its response
-//!     framing instead of relying on it to close.
+//!   - Content-Length and chunked (Transfer-Encoding) request bodies are both
+//!     relayed. Chunked bodies stream through http/chunked.zig's framing
+//!     scanner — forwarded verbatim, never decoded or buffered — so a large
+//!     upload doesn't cost memory and the body boundary is known for keep-alive.
+//!   - One backend connection per *client* connection, reused across that
+//!     client's keep-alive requests: we send the backend "Connection:
+//!     keep-alive" and only drop the socket when the response has no framing,
+//!     the backend sends Connection: close, or it closes early. Backend reuse
+//!     is per-client, so no cross-thread pool or locks are needed — the socket
+//!     belongs to whichever worker thread owns the client connection. A stale
+//!     reused socket (backend idle-closed it) is detected on write and
+//!     reconnected once.
 //!   - One dual-stack listener (AF_INET6 with IPV6_V6ONLY cleared), so v4
 //!     clients arrive here too, mapped as ::ffff:a.b.c.d — no separate v4
 //!     accept loop. Backends may be IPv4 or IPv6 (connectTo handles both)
@@ -50,6 +53,8 @@ const net = std.Io.net; // type-only: IpAddress from balancer.zig, no I/O calls
 const http = @import("../http/parser.zig");
 const Parser = http.Parser;
 const Request = http.Request;
+const Chunked = @import("../http/chunked.zig");
+const util = @import("../http/util.zig");
 
 const RouterMod = @import("../router.zig");
 const Router = RouterMod.Router;
@@ -57,7 +62,9 @@ const Balancer = @import("../balancer.zig").Balancer;
 
 const max_request_head = 8192;
 const max_response_head = 8192;
-const pool_threads = 16;
+
+const ThreadedConfig = @import("../config.zig").ThreadedConfig;
+const log = @import("../log.zig");
 
 /// std.posix.{socket,bind,listen,accept,connect} were removed in 0.16
 /// (moved into std.Io.net's vtable). We already can't route through
@@ -103,7 +110,11 @@ fn sysWrite(fd: posix.fd_t, buf: []const u8) !usize {
     return rc;
 }
 
-pub fn run(allocator: std.mem.Allocator, router: *Router, port: u16) !void {
+fn enableTcpNoDelay(fd: posix.fd_t) void {
+    posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1))) catch {};
+}
+
+pub fn run(allocator: std.mem.Allocator, router: *Router, port: u16, opts: ThreadedConfig) !void {
     // write() to a socket whose peer already closed raises SIGPIPE, and the
     // default action for that is to kill the whole process — not just the
     // thread doing the write. Ignore it so those writes just fail with
@@ -140,31 +151,32 @@ pub fn run(allocator: std.mem.Allocator, router: *Router, port: u16) !void {
     try check(linux.bind(listen_fd, @ptrCast(&bind_addr), @sizeOf(posix.sockaddr.in6)));
     try check(linux.listen(listen_fd, 128));
 
-    // Take pool_threads - 1 slots from worker threads; this (main) thread
+    // Take opts.pool_threads - 1 slots from worker threads; this (main) thread
     // becomes the last worker. Keeps run() blocking forever like the old
     // single accept-loop did, and there's nothing useful for main to do
     // besides pull its share of connections.
-    for (0..pool_threads - 1) |_| {
-        _ = std.Thread.spawn(.{}, workerLoop, .{ allocator, router, listen_fd }) catch |err| {
-            std.debug.print("thread spawn failed: {any}\n", .{err});
+    for (0..opts.pool_threads - 1) |_| {
+        _ = std.Thread.spawn(.{}, workerLoop, .{ allocator, router, listen_fd, opts }) catch |err| {
+            std.debug.print("thread spawn failed: {any}\n", .{err}); // ponytail: not hot path (once per pool), keep direct
         };
     }
-    workerLoop(allocator, router, listen_fd);
+    workerLoop(allocator, router, listen_fd, opts);
 }
 
-fn workerLoop(allocator: std.mem.Allocator, router: *Router, listen_fd: posix.fd_t) void {
+fn workerLoop(allocator: std.mem.Allocator, router: *Router, listen_fd: posix.fd_t, opts: ThreadedConfig) void {
     while (true) {
         var peer: posix.sockaddr.in6 = undefined;
         var peer_len: posix.socklen_t = @sizeOf(posix.sockaddr.in6);
         const conn_fd = sysAccept4(listen_fd, @ptrCast(&peer), &peer_len, posix.SOCK.CLOEXEC) catch |err| {
-            std.debug.print("accept failed: {any}\n", .{err});
+            log.fmt("accept failed: {any}", .{err});
             continue;
         };
-        handleConnection(allocator, router, conn_fd, peer);
+        enableTcpNoDelay(conn_fd);
+        handleConnection(allocator, router, conn_fd, peer, opts);
     }
 }
 
-fn handleConnection(allocator: std.mem.Allocator, router: *Router, conn_fd: posix.fd_t, peer: posix.sockaddr.in6) void {
+fn handleConnection(allocator: std.mem.Allocator, router: *Router, conn_fd: posix.fd_t, peer: posix.sockaddr.in6, opts: ThreadedConfig) void {
     defer sysClose(conn_fd);
 
     // Keep-alive loop: read one request, forward it, and only close when the
@@ -172,6 +184,14 @@ fn handleConnection(allocator: std.mem.Allocator, router: *Router, conn_fd: posi
     // connection unambiguous. The read buffer persists across requests so
     // bytes already pulled off the socket (body leftovers, pipelined heads)
     // aren't lost between iterations.
+    //
+    // `backend` is the backend connection reused across this client
+    // connection's requests. It lives and dies with conn_fd, is touched only
+    // by this worker thread, and is connected lazily — so "keep-alive" here is
+    // per-client backend reuse (no cross-thread pool, no locks).
+    var backend: ?posix.fd_t = null;
+    defer if (backend) |fd| sysClose(fd);
+
     var buf: [max_request_head]u8 = undefined;
     var start: usize = 0;
     var end: usize = 0;
@@ -190,7 +210,7 @@ fn handleConnection(allocator: std.mem.Allocator, router: *Router, conn_fd: posi
                 return;
             }
             const n = posix.read(conn_fd, buf[end..]) catch |err| {
-                std.debug.print("read error: {any}\n", .{err});
+                log.fmt("read error: {any}", .{err});
                 return;
             };
             if (n == 0) return; // peer closed
@@ -203,13 +223,22 @@ fn handleConnection(allocator: std.mem.Allocator, router: *Router, conn_fd: posi
             sendSimple(conn_fd, "400 Bad Request");
             return;
         };
-        const bal = router.route(hostOnly(host_header)) orelse return; // nginx `return 444`-style: deny by closing, no response
+        const bal = router.route(util.hostOnly(host_header)) orelse return; // nginx `return 444`-style: deny by closing, no response
 
-        const keep_alive = forward(allocator, bal, conn_fd, peer, req, &buf, &start, end) catch |err| {
-            std.debug.print("proxy error: {any}\n", .{err});
+        // Chunked request bodies are relayable only when the config enables
+        // that path; otherwise reject before touching the backend.
+        if (req.chunked and !opts.chunked_requests) {
+            sendSimple(conn_fd, "415 Unsupported Media Type");
+            return;
+        }
+
+        const keep_alive = forward(allocator, bal, conn_fd, peer, req, &buf, &start, &end, &backend, opts) catch |err| {
+            log.fmt("proxy error: {any}", .{err});
             return; // any error tears the whole connection down
         };
-        if (!keep_alive) return;
+        // Close after this response when the client asked to, the framing
+        // can't be kept unambiguous, or config says never keep the client alive.
+        if (!keep_alive or !opts.client_keepalive) return;
 
         // Slide the unconsumed tail (pipelined next request) to the front for
         // the next iteration.
@@ -228,23 +257,24 @@ fn forward(
     req: Request,
     buf: *[max_request_head]u8,
     start: *usize,
-    end: usize,
+    end: *usize,
+    backend_opt: *?posix.fd_t,
+    opts: ThreadedConfig,
 ) !bool {
     _ = allocator; // not needed yet — everything here is fixed-size buffers
 
-    if (req.chunked) {
-        sendSimple(client_fd, "501 Not Implemented");
-        return false;
-    }
-
+    // Reuse the existing backend connection if the previous request left it
+    // reusable; otherwise open a fresh one. The balancer's preferred address
+    // is Picked once per connection and reused throughout its lifetime.
     const backend_addr = bal.pick();
-    const backend_fd = try connectTo(backend_addr);
-    defer sysClose(backend_fd);
+    var backend_fd: posix.fd_t = if (backend_opt.* != null) backend_opt.*.? else try connectTo(backend_addr);
+    const was_reused = backend_opt.* != null;
+    errdefer sysClose(backend_fd); // any error tears the connection down
 
     // Build the request head into one buffer, then write it in as few
     // syscalls as possible (writeAll below still loops for partial writes).
-    // We force Connection: close to the backend so it closes after one
-    // response — that EOF is what terminates the response relay below.
+    // The backend connection is kept alive and presumed reusable: only a
+    // response without framing (or a Connection: close) makes us drop it.
     var head: [max_request_head]u8 = undefined;
     var head_len: usize = 0;
     head_len += (try std.fmt.bufPrint(head[head_len..], "{s} {s} HTTP/1.1\r\n", .{ req.method, req.target })).len;
@@ -255,18 +285,45 @@ fn forward(
         if (std.ascii.eqlIgnoreCase(h.name, "x-forwarded-for")) continue;
         head_len += (try std.fmt.bufPrint(head[head_len..], "{s}: {s}\r\n", .{ h.name, h.value })).len;
     }
-    head_len = try writeForwardedFor(&head, head_len, peer.addr);
+    head_len = try util.writeForwardedFor(&head, head_len, peer.addr);
     head_len += (try std.fmt.bufPrint(head[head_len..], "Via: 1.1 reverse-proxy\r\n", .{})).len;
-    head_len += (try std.fmt.bufPrint(head[head_len..], "Connection: close\r\n\r\n", .{})).len;
+    // The parser strips Transfer-Encoding as hop-by-hop, but a chunked body
+    // must be announced to the backend or its bytes won't make sense to it.
+    // Content-Length bodies never carry TE, so the two are mutually exclusive.
+    if (req.chunked) {
+        head_len += (try std.fmt.bufPrint(head[head_len..], "Transfer-Encoding: chunked\r\n", .{})).len;
+    }
+    // Only ask the backend to keep the socket alive (and thus pay the reuse
+    // bookkeeping) when the client is actually going to reuse this connection
+    // AND the config allows backend keep-alive.
+    // ponytail: for a Connection: close client every request is one-shot, so
+    // requesting keep-alive here adds backend overhead with no reuse payoff —
+    // nginx measured 2.5x slower under such a workload than sending close.
+    const backend_keepalive = req.keep_alive and opts.backend_keepalive;
+    head_len += (try std.fmt.bufPrint(head[head_len..], "Connection: {s}\r\n\r\n", .{if (backend_keepalive) "keep-alive" else "close"})).len;
 
-    try writeAll(backend_fd, head[0..head_len]);
+    // A reused backend may have gone stale while idle (peer closed it, e.g.
+    // its own keep-alive timeout fired). A write to a closed-but-buffered
+    // socket often doesn't fail until the read below; detect a stale write and
+    // reconnect once so a single server-side close doesn't kill the request.
+    writeHead: {
+        writeAll(backend_fd, head[0..head_len]) catch |err| {
+            if (!was_reused) return err;
+            sysClose(backend_fd);
+            backend_fd = try connectTo(backend_addr);
+            try writeAll(backend_fd, head[0..head_len]);
+            break :writeHead;
+        };
+    }
 
-    if (req.content_length) |content_length| {
+    if (req.chunked) {
+        try forwardChunkedBody(client_fd, backend_fd, buf, start, end);
+    } else if (req.content_length) |content_length| {
         var remaining = content_length;
 
         // Consume body bytes that arrived in the buffer already (they follow
         // the head with no gap), then stream the rest straight from the client.
-        const bufbod = @min(end - start.*, remaining);
+        const bufbod = @min(end.* - start.*, remaining);
         if (bufbod > 0) {
             try writeAll(backend_fd, buf.*[start.* .. start.* + bufbod]);
             start.* += bufbod;
@@ -283,19 +340,68 @@ fn forward(
         }
     }
 
-    return relayResponse(client_fd, backend_fd, req.keep_alive);
+    const res = try relayResponse(client_fd, backend_fd, req, opts.client_keepalive);
+    if (res.backend_keep and backend_keepalive) {
+        backend_opt.* = backend_fd; // hand the socket back for the next request
+    } else {
+        sysClose(backend_fd);
+        backend_opt.* = null;
+    }
+    return res.client_keep;
 }
 
-/// Relays the backend's response to the client but parses the response head
-/// enough to (a) rewrite the Connection header for the client hop and
-/// (b) decide whether the client connection can stay alive. The body is
-/// still streamed verbatim until the backend closes.
+/// Streams a chunked request body to the backend verbatim while scanning for
+/// its end, so only the terminal "0\r\n[trailers]\r\n" is consumed — bytes
+/// beyond it (a pipelined next request) stay in the [start..end) window for
+/// the keep-alive loop.
+fn forwardChunkedBody(
+    client_fd: posix.fd_t,
+    backend_fd: posix.fd_t,
+    buf: *[max_request_head]u8,
+    start: *usize,
+    end: *usize,
+) !void {
+    var scan: Chunked.Scanner = .{};
+    while (!scan.done) {
+        if (start.* == end.*) {
+            // Buffered body consumed; compact (start sits at end so the whole
+            // window is free) and read more from the client.
+            start.* = 0;
+            end.* = 0;
+            const n = try posix.read(client_fd, buf.*[0..]);
+            if (n == 0) return error.ClientClosedMidChunked;
+            end.* = n;
+        }
+        const res = try scan.feed(buf.*[start.*..end.*]);
+        try writeAll(backend_fd, buf.*[start.* .. start.* + res.consumed]);
+        start.* += res.consumed;
+    }
+}
+
+/// Relays the backend's response to the client, parsing the response head to
+/// rewrite the Connection header for the client hop and stream the body to a
+/// clean framing boundary so the backend socket can be kept alive and reused.
 ///
-/// Keep-alive is only offered back to the client when the response declares
+/// Keep-alive (client and backend) is only offered when the response declares
 /// framing (Content-Length or Transfer-Encoding) — otherwise the body is
 /// delimited by connection-close and there's no unambiguous point to start
 /// the next request on the same socket.
-fn relayResponse(client_fd: posix.fd_t, backend_fd: posix.fd_t, req_keep_alive: bool) !bool {
+const RelayResult = struct {
+    client_keep: bool, // keep the client connection alive
+    backend_keep: bool, // this backend socket is at a clean message boundary, safe to reuse
+};
+
+/// Relays the backend's response to the client. Parses the response head
+/// enough to (a) rewrite the Connection header for the client hop,
+/// (b) stream the body to an exact framing boundary so the backend socket can
+/// be kept alive and reused, and (c) work out both keep-alive verdicts.
+///
+/// A Backend socket is only returned as reusable when the response had
+/// unambiguous framing we consumed in full (Content-Length or chunked). An
+/// EOF-framed body, an early close, or a response Connection: close all drop
+/// the socket. The client verdict additionally requires explicit framing —
+/// a client can't delimit a close-delimited body either.
+fn relayResponse(client_fd: posix.fd_t, backend_fd: posix.fd_t, req: Request, client_keepalive: bool) !RelayResult {
     var hbuf: [max_response_head]u8 = undefined;
     var hlen: usize = 0;
     var term: ?usize = null;
@@ -309,7 +415,9 @@ fn relayResponse(client_fd: posix.fd_t, backend_fd: posix.fd_t, req_keep_alive: 
     const t = term.?;
     const head = hbuf[0..t];
 
-    var has_framing = false;
+    var content_length: ?u64 = null;
+    var chunked_te = false;
+    var response_conn_close = false;
     var out: [max_response_head]u8 = undefined;
     var out_len: usize = 0;
 
@@ -319,8 +427,14 @@ fn relayResponse(client_fd: posix.fd_t, backend_fd: posix.fd_t, req_keep_alive: 
     while (lines.next()) |line| {
         const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
         const name = std.mem.trim(u8, line[0..colon], " \t");
-        if (std.ascii.eqlIgnoreCase(name, "content-length")) has_framing = true;
-        if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) has_framing = true;
+        const val = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        if (std.ascii.eqlIgnoreCase(name, "content-length")) {
+            content_length = std.fmt.parseUnsigned(u64, val, 10) catch return error.BadResponseHead;
+        } else if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
+            chunked_te = containsTokenIgnoreCase(val, "chunked");
+        } else if (std.ascii.eqlIgnoreCase(name, "connection")) {
+            if (containsTokenIgnoreCase(val, "close")) response_conn_close = true;
+        }
         // Drop the Connection and Keep-Alive headers; we rewrite Connection
         // for the client hop below. Everything else is relayed verbatim —
         // the client still needs Content-Length / Transfer-Encoding to frame.
@@ -328,33 +442,113 @@ fn relayResponse(client_fd: posix.fd_t, backend_fd: posix.fd_t, req_keep_alive: 
         out_len += (try std.fmt.bufPrint(out[out_len..], "{s}\r\n", .{line})).len;
     }
 
-    const keep_alive = req_keep_alive and has_framing;
+    const has_framing = content_length != null or chunked_te;
+    const client_keep = req.keep_alive and client_keepalive and has_framing;
     out_len += (try std.fmt.bufPrint(
         out[out_len..],
         "Connection: {s}\r\n\r\n",
-        .{if (keep_alive) "keep-alive" else "close"},
+        .{if (client_keep) "keep-alive" else "close"},
     )).len;
     try writeAll(client_fd, out[0..out_len]);
 
-    // Relay any body already read past the head, then drain the backend until
-    // it closes (it will — we asked it to via Connection: close).
-    if (t + 4 < hlen) try writeAll(client_fd, hbuf[t + 4 .. hlen]);
+    // Body boundary for the *backend* socket: messages that carry no body at
+    // all (HEAD, 1xx, 204, 304) end right after the head regardless of any
+    // Content-Length header, so nothing to drain.
+    const bodyless = std.ascii.eqlIgnoreCase(req.method, "head") or
+        statusHasNoBody(status_line);
+    var backend_keep: bool = undefined;
+
+    if (bodyless) {
+        backend_keep = true;
+    } else if (chunked_te) {
+        backend_keep = try relayChunkedResponseBody(client_fd, backend_fd, hbuf[t + 4 .. hlen]);
+    } else if (content_length) |cl| {
+        backend_keep = try relayFixedResponseBody(client_fd, backend_fd, hbuf[t + 4 .. hlen], cl);
+    } else {
+        // EOF-framed: relay until the backend closes. Can't reuse it, and the
+        // client can't delimit the body, so both hops close.
+        relayUntilEof(client_fd, backend_fd, hbuf[t + 4 .. hlen]);
+        backend_keep = false;
+    }
+
+    backend_keep = backend_keep and !response_conn_close;
+    return .{ .client_keep = client_keep, .backend_keep = backend_keep };
+}
+
+fn relayFixedResponseBody(client_fd: posix.fd_t, backend_fd: posix.fd_t, tail: []const u8, content_length: u64) !bool {
+    var remaining: u64 = content_length;
+    const from_tail = @min(@as(u64, tail.len), remaining);
+    if (from_tail > 0) try writeAll(client_fd, tail[0..from_tail]);
+    remaining -= from_tail;
+
+    var pump: [4096]u8 = undefined;
+    while (remaining > 0) {
+        const want = pump[0..@min(@as(usize, pump.len), @as(usize, @intCast(remaining)))];
+        const n = try posix.read(backend_fd, want);
+        if (n == 0) return false; // backend closed early -> don't reuse
+        try writeAll(client_fd, want[0..n]);
+        remaining -= n;
+    }
+    return true; // read all Content-Length bytes; socket boundary is clean
+}
+
+fn relayChunkedResponseBody(client_fd: posix.fd_t, backend_fd: posix.fd_t, tail: []const u8) !bool {
+    var scan: Chunked.Scanner = .{};
+    var feed = tail;
+    var pump: [4096]u8 = undefined;
+    while (!scan.done) {
+        const res = try scan.feed(feed);
+        try writeAll(client_fd, feed[0..res.consumed]);
+        if (res.done) return true; // reached the terminal chunk; boundary clean
+        const n = try posix.read(backend_fd, &pump);
+        if (n == 0) return false; // closed mid-chunked-body -> don't reuse
+        feed = pump[0..n];
+    }
+    unreachable;
+}
+
+/// Relays the tail then keeps reading the backend to EOF. Used only for
+/// close-delimited (framing-less) bodies, so the socket is never reused.
+fn relayUntilEof(client_fd: posix.fd_t, backend_fd: posix.fd_t, tail: []const u8) void {
+    if (tail.len > 0) writeAll(client_fd, tail) catch {};
     var pump: [4096]u8 = undefined;
     while (true) {
-        const n = try posix.read(backend_fd, &pump);
-        if (n == 0) break;
-        try writeAll(client_fd, pump[0..n]);
+        const n = posix.read(backend_fd, &pump) catch return;
+        if (n == 0) return;
+        writeAll(client_fd, pump[0..n]) catch return;
     }
-    return keep_alive;
 }
 
 /// Connects to an Io.net.IpAddress (already resolved by balancer.zig) over a
 /// raw std.posix socket. Handles both IPv4 and IPv6 backends.
+fn containsTokenIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0 or haystack.len < needle.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
+    }
+    return false;
+}
+
+/// Whether a response status line ("HTTP/1.1 204 No Content") denotes a
+/// message that carries no body — so no body bytes follow the head even if a
+/// Content-Length header is present.
+fn statusHasNoBody(status_line: []const u8) bool {
+    var parts = std.mem.splitScalar(u8, status_line, ' ');
+    _ = parts.next() orelse return false; // "HTTP/1.1"
+    const code_str = parts.next() orelse return false;
+    const code = std.fmt.parseInt(u16, code_str, 10) catch return false;
+    return code < 200 or code == 204 or code == 304;
+}
+
 fn connectTo(addr: net.IpAddress) !posix.fd_t {
+    // Disable Nagle on backend sockets: small keep-alive requests otherwise
+    // stall ~40ms against the peer's delayed ACK. nginx does the same.
     switch (addr) {
         .ip4 => |ip4| {
             const fd = try sysSocket(posix.AF.INET, posix.SOCK.STREAM, posix.IPPROTO.TCP);
             errdefer sysClose(fd);
+            enableTcpNoDelay(fd);
             const sa: posix.sockaddr.in = .{
                 .family = posix.AF.INET,
                 .port = std.mem.nativeToBig(u16, ip4.port),
@@ -367,6 +561,7 @@ fn connectTo(addr: net.IpAddress) !posix.fd_t {
         .ip6 => |ip6| {
             const fd = try sysSocket(posix.AF.INET6, posix.SOCK.STREAM, posix.IPPROTO.TCP);
             errdefer sysClose(fd);
+            enableTcpNoDelay(fd);
             const sa: posix.sockaddr.in6 = .{
                 .family = posix.AF.INET6,
                 .port = std.mem.nativeToBig(u16, ip6.port),
@@ -395,61 +590,4 @@ fn sendSimple(fd: posix.fd_t, status: []const u8) void {
         .{status},
     ) catch return;
     writeAll(fd, msg) catch {};
-}
-
-/// Writes the X-Forwarded-For header for a raw v6 sockaddr's 16-byte
-/// address, unmapping v4-mapped addresses (::ffff:a.b.c.d) back to plain
-/// dotted-quad since that's what downstream log parsers expect from a v4
-/// client — the listener being dual-stack shouldn't leak into the header
-/// shape. Returns the new head_len.
-fn writeForwardedFor(head: []u8, head_len: usize, addr: [16]u8) !usize {
-    const is_v4_mapped = std.mem.eql(u8, addr[0..10], &[_]u8{0} ** 10) and
-        addr[10] == 0xff and addr[11] == 0xff;
-    if (is_v4_mapped) {
-        return head_len + (try std.fmt.bufPrint(
-            head[head_len..],
-            "X-Forwarded-For: {d}.{d}.{d}.{d}\r\n",
-            .{ addr[12], addr[13], addr[14], addr[15] },
-        )).len;
-    }
-    // ponytail: expanded form only (no :: compression, no leading-zero
-    // trimming) — correct but ugly. Fine for a header nothing parses
-    // strictly. Upgrade path: std.net.Ip6Address's formatter if/once it's
-    // stable again post-0.16 std.Io churn.
-    const groups: [8]u16 = @bitCast(addr);
-    return head_len + (try std.fmt.bufPrint(
-        head[head_len..],
-        "X-Forwarded-For: {x}:{x}:{x}:{x}:{x}:{x}:{x}:{x}\r\n",
-        .{
-            std.mem.bigToNative(u16, groups[0]), std.mem.bigToNative(u16, groups[1]),
-            std.mem.bigToNative(u16, groups[2]), std.mem.bigToNative(u16, groups[3]),
-            std.mem.bigToNative(u16, groups[4]), std.mem.bigToNative(u16, groups[5]),
-            std.mem.bigToNative(u16, groups[6]), std.mem.bigToNative(u16, groups[7]),
-        },
-    )).len;
-}
-
-/// Strips a ":port" suffix (or keeps a "[ipv6]" literal intact) so the
-/// result matches what Router.route expects.
-fn hostOnly(h: []const u8) []const u8 {
-    if (h.len > 0 and h[0] == '[') {
-        const end = std.mem.indexOfScalar(u8, h, ']') orelse return h;
-        return h[0 .. end + 1];
-    }
-    const colon = std.mem.lastIndexOfScalar(u8, h, ':') orelse return h;
-    return h[0..colon];
-}
-
-test "v4-mapped address unmaps to dotted-quad in X-Forwarded-For" {
-    var head: [128]u8 = undefined;
-    const mapped: [16]u8 = [_]u8{0} ** 10 ++ [_]u8{ 0xff, 0xff, 10, 0, 0, 1 };
-    const len = try writeForwardedFor(&head, 0, mapped);
-    try std.testing.expectEqualStrings("X-Forwarded-For: 10.0.0.1\r\n", head[0..len]);
-}
-
-test "real v6 address stays expanded hex, not misread as v4" {
-    var head: [128]u8 = undefined;
-    const real_v6: [16]u8 = [_]u8{ 0x20, 0x01 } ++ [_]u8{0} ** 14;
-    const len = try writeForwardedFor(&head, 0, real_v6);
-    try std.testing.expect(std.mem.startsWith(u8, head[0..len], "X-Forwarded-For: 2001:"));
 }

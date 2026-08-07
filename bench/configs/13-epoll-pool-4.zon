@@ -1,0 +1,9 @@
+.{
+    .listen = 8880,
+    .server = .{
+        .kind = .epoll,
+        .epoll = .{ .pool_size = 4 },
+    },
+    .vhosts = .{},
+    .default_backends = .{"127.0.0.1:8888"},
+}
