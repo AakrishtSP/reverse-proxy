@@ -41,7 +41,13 @@ pub const EpollConfig = struct {
     /// Fixed number of preallocated client connections (in-flight requests).
     /// Each slot owns its read/write buffers, so this bounds heap usage up
     /// front. When exhausted, new connections are refused until a slot frees.
+    /// With `loops > 1` this total is split evenly across the loops.
     max_connections: usize = 2048,
+    /// Number of independent epoll event loops. Each loop owns its own listen
+    /// socket bound with SO_REUSEPORT and its own ConnPool partition, so the
+    /// keep-alive (CPU-bound) path scales across cores. `1` is the classic
+    /// single-loop server.
+    loops: usize = 1,
 };
 
 pub const ServerConfig = struct {
@@ -72,6 +78,7 @@ const default_config_zon =
     \\            .chunked_requests = true,
     \\            .pool_size = 100,
     \\            .max_connections = 2048,
+    \\            .loops = 1,
     \\        },
     \\    },
     \\    .vhosts = .{},
@@ -144,7 +151,7 @@ pub fn printConfig(config: Config, stdio: *StdIo) !void {
     try stdio.println("\t.server: .{{", .{});
     try stdio.println("\t\t.kind: .{s},", .{@tagName(config.server.kind)});
     try stdio.println(
-        "\t\t.threaded: .{{.pool_threads: {d}, .client_keepalive: {}, .backend_keepalive: {}, .chunked_requests: {}}},\n\t\t.epoll: .{{.client_keepalive: {}, .backend_keepalive: {}, .chunked_requests: {}, .pool_size: {d}, .max_connections: {d}}},\n\t}},\n\t.vhosts: ",
+        "\t\t.threaded: .{{.pool_threads: {d}, .client_keepalive: {}, .backend_keepalive: {}, .chunked_requests: {}}},\n\t\t.epoll: .{{.client_keepalive: {}, .backend_keepalive: {}, .chunked_requests: {}, .pool_size: {d}, .max_connections: {d}, .loops: {d}}},\n\t}},\n\t.vhosts: ",
         .{
             config.server.threaded.pool_threads,
             config.server.threaded.client_keepalive,
@@ -155,6 +162,7 @@ pub fn printConfig(config: Config, stdio: *StdIo) !void {
             config.server.epoll.chunked_requests,
             config.server.epoll.pool_size,
             config.server.epoll.max_connections,
+            config.server.epoll.loops,
         },
     );
     try stdio.println("\t.{{", .{});

@@ -1,6 +1,9 @@
-//! Single-threaded epoll-based HTTP/1.1 proxy loop, framed for keep-alive.
+//! epoll-based HTTP/1.1 proxy loops, framed for keep-alive.
 //!
-//! One event loop, level-triggered epoll, non-blocking sockets everywhere.
+//! By default one event loop; with `EpollConfig.loops > 1` there are N loops,
+//! each with its own SO_REUSEPORT listener, epoll fd, and partitioned ConnPool
+//! + backend pool, so the CPU-bound keep-alive path scales across cores. Each
+//! loop is: level-triggered epoll, non-blocking sockets everywhere.
 //! Each client connection is a state machine; the backend socket is borrowed
 //! from (and returned to) a shared pool so it is reused across requests —
 //! including across different clients. Only ONE fd per connection has non-zero
@@ -157,6 +160,10 @@ const Pool = struct {
     cap: usize,
 
     const Item = struct { fd: posix.fd_t, addr: net.IpAddress };
+
+    fn init(allocator: std.mem.Allocator, cap: usize) !Pool {
+        return .{ .allocator = allocator, .cap = cap };
+    }
 
     fn borrow(self: *Pool, addr: net.IpAddress) ?posix.fd_t {
         var i = self.items.items.len;
@@ -856,11 +863,32 @@ pub fn run(allocator: std.mem.Allocator, router: *Router, port: u16, opts: Epoll
     };
     posix.sigaction(posix.SIG.PIPE, &sigpipe_action, null);
 
-    const listen_fd = try sysSocket(posix.AF.INET6, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, posix.IPPROTO.TCP);
+    // N independent event loops, each with its own SO_REUSEPORT listener so the
+    // kernel hash-balances accepted connections across them. Max_conections and
+    // the backend pool are partitioned per loop (lock-free; ~even under kernel
+    // hashing). The calling thread runs the last loop so run() blocks forever,
+    // like threaded.
+    const n = @max(@as(usize, 1), opts.loops);
+    for (0..n - 1) |_| {
+        _ = std.Thread.spawn(.{}, loopWorker, .{ allocator, router, port, opts }) catch |err| {
+            log.fmt("epoll loop spawn failed: {any}", .{err});
+        };
+    }
+    loopWorker(allocator, router, port, opts);
+}
+
+fn loopWorker(allocator: std.mem.Allocator, router: *Router, port: u16, opts: EpollConfig) void {
+    const n = @max(@as(usize, 1), opts.loops);
+
+    const listen_fd = sysSocket(posix.AF.INET6, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, posix.IPPROTO.TCP) catch |err| {
+        log.fmt("socket failed: {any}", .{err});
+        return;
+    };
     defer sysClose(listen_fd);
 
-    try posix.setsockopt(listen_fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
-    try posix.setsockopt(listen_fd, posix.IPPROTO.IPV6, posix.IPV6.V6ONLY, &std.mem.toBytes(@as(c_int, 0)));
+    posix.setsockopt(listen_fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1))) catch {};
+    posix.setsockopt(listen_fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, &std.mem.toBytes(@as(c_int, 1))) catch {};
+    posix.setsockopt(listen_fd, posix.IPPROTO.IPV6, posix.IPV6.V6ONLY, &std.mem.toBytes(@as(c_int, 0))) catch {};
 
     const bind_addr: posix.sockaddr.in6 = .{
         .family = posix.AF.INET6,
@@ -869,37 +897,42 @@ pub fn run(allocator: std.mem.Allocator, router: *Router, port: u16, opts: Epoll
         .addr = [_]u8{0} ** 16,
         .scope_id = 0,
     };
-    try check(linux.bind(listen_fd, @ptrCast(&bind_addr), @sizeOf(posix.sockaddr.in6)));
-    try check(linux.listen(listen_fd, 128));
+    if (linux.bind(listen_fd, @ptrCast(&bind_addr), @sizeOf(posix.sockaddr.in6)) != 0) return;
+    if (linux.listen(listen_fd, 128) != 0) return;
 
     const epfd = epollCreate() catch |err| {
         log.fmt("epoll_create1 failed: {any}", .{err});
-        return err;
+        return;
     };
     defer sysClose(epfd);
 
     var lev: linux.epoll_event = .{ .events = linux.EPOLL.IN, .data = .{ .fd = listen_fd } };
-    try check(linux.epoll_ctl(epfd, linux.EPOLL.CTL_ADD, listen_fd, &lev));
+    if (linux.epoll_ctl(epfd, linux.EPOLL.CTL_ADD, listen_fd, &lev) != 0) return;
 
-    const conns = try ConnPool.init(allocator, opts.max_connections);
+    // Total max_connections budget split across loops; each loop refuses accepts
+    // when its own share is exhausted. Remainder is dropped (per = floor(n)).
+    const conns = ConnPool.init(allocator, @max(@as(usize, 1), opts.max_connections / n)) catch return;
     defer conns.deinit(allocator);
+
+    // Backend pool cap also partitioned so total idle sockets stay ~bounded.
+    const pool = Pool.init(allocator, @max(@as(usize, 1), opts.pool_size / n)) catch return;
+    defer pool.deinit();
 
     var loop = Loop{
         .allocator = allocator,
         .router = router,
         .epfd = epfd,
         .conns = conns,
-        .pool = .{ .allocator = allocator, .cap = opts.pool_size },
+        .pool = pool,
     };
-    defer loop.pool.deinit();
 
     var events: [max_events]linux.epoll_event = undefined;
     while (true) {
-        const n = epollWait(epfd, &events, @intCast(events.len), -1) catch |err| {
+        const nr = epollWait(epfd, &events, @intCast(events.len), -1) catch |err| {
             log.fmt("epoll_wait failed: {any}", .{err});
             continue;
         };
-        for (events[0..n]) |ev| {
+        for (events[0..nr]) |ev| {
             if (ev.data.fd == listen_fd) {
                 loop.acceptClients(listen_fd, opts);
                 continue;
