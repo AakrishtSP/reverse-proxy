@@ -46,24 +46,14 @@
 # to batch or reuse a warm process. A cold first request per run is noise on a
 # 30s test; not worth engineering around.
 set -euo pipefail
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BENCH_DIR="$REPO_ROOT/bench"
-RESULTS="${HARNESS_RESULTS:-$BENCH_DIR/results.jsonl}"
-TMP="$BENCH_DIR/tmp"
-# Bench a dedicated ReleaseFast build so numbers reflect optimized code, never
-# a stray Debug build or /usr/bin. Built here, not reusing zig-out/bin.
-BIN="$TMP/reverse_proxy"
 NGINX_CONF="$TMP/nginx-proxy.conf"
-BACKEND_PID="$TMP/backend.pid"
 NGINX_PID="$TMP/nginx-proxy.pid"
-BACKEND_PORT=8888
 NGINX_PORT=8885
-BACKEND_BIN="$TMP/backend"
 DURATION="${HARNESS_DURATION:-10s}"
 WRK_THREADS=4
 : "${WRK_ARGS:=-L}"
-COMMIT="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
 CONFIGS=()
 WANT_NGINX=0
@@ -87,23 +77,12 @@ MODES=(close open) && [ "$UPLOAD" -eq 1 ] && MODES=(upload)
 [ "${#CONFIGS[@]}" -eq 0 ] && [ "$WANT_NGINX" -eq 0 ] && CONFIGS=("$REPO_ROOT/config.zon")
 
 mkdir -p "$TMP"
-# ReleaseFast build for benching, copied into the temp dir so this never
-# depends on (or clobbers) a manual `zig build` artifact.
-if ! zig build -Doptimize=ReleaseFast >/dev/null 2>&1; then
-    echo "failed to build the proxy (ReleaseFast)" >&2
-    exit 1
-fi
-cp -f "$REPO_ROOT/zig-out/bin/reverse_proxy" "$BIN"
-[ -x "$BIN" ] || { echo "release build produced no binary at $BIN" >&2; exit 1; }
-command -v cc >/dev/null || { echo "cc not on PATH (needed to build the C backend)" >&2; exit 1; }
-if [ "$WANT_NGINX" -eq 1 ]; then
-    command -v nginx >/dev/null || { echo "nginx not on PATH (needed for -n)" >&2; exit 1; }
-fi
+ensure_proxy
+ensure_backend
+command -v nginx >/dev/null 2>&1 || [ "$WANT_NGINX" -eq 0 ] || {
+    echo "nginx not on PATH (needed for -n)" >&2; exit 1; }
 VENV_PY="$REPO_ROOT/.venv/bin/python3"
 [ -x "$VENV_PY" ] || { echo "missing $VENV_PY — run: python3 -m venv .venv && .venv/bin/pip install ipykernel pandas matplotlib" >&2; exit 1; }
-
-mkdir -p "$TMP"
-cc -O2 -o "$BACKEND_BIN" "$BENCH_DIR/backend.c" || { echo "failed to build C backend" >&2; exit 1; }
 
 # --- parse_and_emit: wrk output file -> one JSON row -------------------------
 # Columns kept are exactly what the notebook consumes: identity (stage, kind,
@@ -196,34 +175,10 @@ run_sweep() {  # stage kind port
     done
 }
 
-wait_port() {
-    local port="$1"
-    for _ in $(seq 1 50); do
-        (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && return 0
-        sleep 0.1
-    done
-    return 1
-}
-
-stop_backend() {
-    [ -f "$BACKEND_PID" ] || return 0
-    kill "$(cat "$BACKEND_PID")" 2>/dev/null || true
-    wait "$(cat "$BACKEND_PID")" 2>/dev/null || true
-    rm -f "$BACKEND_PID"
-}
 trap stop_backend EXIT
 
-stop_backend
-"$BACKEND_BIN" > "$TMP/backend.log" 2>&1 &
-echo $! > "$BACKEND_PID"
-wait_port "$BACKEND_PORT" || {
-    echo "C backend failed to listen on :$BACKEND_PORT" >&2
-    cat "$TMP/backend.log" >&2
-    stop_backend
-    exit 1
-}
+start_backend
 echo "backend up on :$BACKEND_PORT" >&2
-sleep 0.3
 
 count=0
 if [ "$WANT_NGINX" -eq 1 ]; then

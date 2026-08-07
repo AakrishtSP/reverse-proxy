@@ -24,6 +24,8 @@ bench/*
 !bench/bench.sh
 !bench/harness.sh
 !bench/run-all.sh
+!bench/run-missing.sh
+!bench/lib.sh
 !bench/results.jsonl
 !bench/configs/
 !bench/upload-chunked.lua

@@ -110,13 +110,21 @@ own port and stopped after its run.
 ```bash
 bench/harness.sh                                   # default: repo config.zon, c 10 50 100 200 500 1000
 bench/harness.sh -c bench/configs/14-epoll-loops-4.zon -n 3 50 200
-bench/run-all.sh                                   # every config in bench/configs/
+bench/run-all.sh                                   # every config in bench/configs/ (fresh, archives old)
+bench/run-missing.sh                               # ONLY configs with no results rows yet (append-only)
 ```
 
 Flags: `-c <config.zon>` (repeatable, stage = basename), `-n` (also bench an
 equivalent stock-nginx proxy against the same `:8888` backend), `-u`
 (chunked-upload workload via `bench/upload-chunked.lua`), then `repeats` and
-`concurrencies`.
+`concurrencies`. `run-all.sh` archives the previous `results.jsonl`
+(`.bak`) and starts fresh; `run-missing.sh` (add `-a` to force every config)
+appends only the configs that aren't in `results.jsonl` yet, so after adding
+one config you bench just that one instead of the whole set.
+
+`bench/lib.sh` is the shared core the bench scripts all source (ReleaseFast
+proxy build, C backend build/start/stop, port probes, config helpers); the
+entrypoints only keep their own orchestration.
 
 One-time setup for the analysis notebook:
 
