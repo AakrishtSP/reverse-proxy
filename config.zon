@@ -1,5 +1,9 @@
 .{
     .listen = 8880,
+    .server = .{
+        .kind = .threaded,
+        .threaded = .{ .pool_threads = 16 },
+    },
     .vhosts = .{
         .{
             .hostnames = .{"jellyfin.internal"},

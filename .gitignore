@@ -23,4 +23,7 @@ tmp
 bench/*
 !bench/bench.sh
 !bench/harness.sh
+!bench/run-all.sh
 !bench/results.jsonl
+!bench/configs/
+!bench/upload-chunked.lua

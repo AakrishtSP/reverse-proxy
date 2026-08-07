@@ -16,26 +16,51 @@ pub fn main(init: std.process.Init) !void {
     defer arena.deinit();
     const arena_allocator = arena.allocator();
 
-    var path_buf: [std.posix.PATH_MAX]u8 = undefined;
-    const path = Config.resolveConfigPath(init, &path_buf) catch |err| switch (err) {
-        error.FileNotFound => {
-            try stdio.eprintln("Error: File not Found", .{});
-            try stdio.println("Do you want to create a default config? (y/n) ", .{});
-            try stdio.flush();
-            const answer = try stdio.readChar();
-            if (answer != 'y') return;
-            return Config.writeDefaultConfig(init, "config.zon") catch |er| {
-                try stdio.eprintln("Error: {any}\n", .{er});
-                return er;
+    var config_path: ?[]const u8 = null;
+    var args = std.process.Args.Iterator.init(init.minimal.args);
+    _ = args.skip(); // argv[0]
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "-c")) {
+            config_path = args.next() orelse {
+                try stdio.eprintln("-c requires a config path", .{});
+                return error.Usage;
             };
-        },
-        else => return err,
+        } else {
+            try stdio.eprintln("usage: reverse_proxy [-c <config.zon>]", .{});
+            return error.Usage;
+        }
+    }
+
+    const path = if (config_path) |p|
+        p
+    else blk: {
+        var path_buf: [std.posix.PATH_MAX]u8 = undefined;
+        break :blk Config.resolveConfigPath(init, &path_buf) catch |err| switch (err) {
+            error.FileNotFound => {
+                try stdio.eprintln("Error: File not Found", .{});
+                try stdio.println("Do you want to create a default config? (y/n) ", .{});
+                try stdio.flush();
+                const answer = try stdio.readChar();
+                if (answer != 'y') return;
+                return Config.writeDefaultConfig(init, "config.zon") catch |er| {
+                    try stdio.eprintln("Error: {any}\n", .{er});
+                    return er;
+                };
+            },
+            else => return err,
+        };
     };
     const config = try Config.load(init, arena_allocator, path);
     try Config.printConfig(config, &stdio);
 
     var router = try Router.build(init.io, arena_allocator, config);
-    try Server.run(arena_allocator, &router, config.listen);
+    switch (config.server.kind) {
+        .threaded => try Server.run(arena_allocator, &router, config.listen, config.server.threaded),
+        .epoll => {
+            try stdio.eprintln("server backend `epoll` is not implemented yet; use `.threaded`", .{});
+            return error.BackendNotImplemented;
+        },
+    }
 }
 
 test {

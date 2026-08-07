@@ -7,8 +7,34 @@ pub const VhostConfig = struct {
     backends: []const []const u8,
 };
 
+/// Options for the thread-per-connection backend. Buffer sizes stay
+/// compile-time constants (they size stack arrays), so only the pool size is
+/// runtime-tunable here.
+pub const ThreadedConfig = struct {
+    pool_threads: u16 = 16,
+    /// Keep the client connection alive across requests when the client asks
+    /// for it. When false, every response answers Connection: close and the
+    /// socket is shut after one request.
+    client_keepalive: bool = true,
+    /// Reuse the backend connection across a client's keep-alive requests.
+    /// When false, every request gets a fresh backend connection (and asks the
+    /// backend to close it). Only pays off when the client keeps alive.
+    backend_keepalive: bool = true,
+    /// Relay chunked (Transfer-Encoding: chunked) request bodies. When false,
+    /// chunked requests are rejected with 415 before reaching the backend.
+    chunked_requests: bool = true,
+};
+
+pub const ServerConfig = struct {
+    /// Which serving backend to use. Only `threaded` is implemented today;
+    /// `epoll` is reserved and rejected at startup.
+    kind: enum { threaded, epoll } = .threaded,
+    threaded: ThreadedConfig = .{},
+};
+
 pub const Config = struct {
     listen: u16,
+    server: ServerConfig = .{},
     vhosts: []const VhostConfig,
     default_backends: ?[]const []const u8 = null,
 };
@@ -16,6 +42,10 @@ pub const Config = struct {
 const default_config_zon =
     \\.{
     \\    .listen = 8080,
+    \\    .server = .{
+    \\        .kind = .threaded,
+    \\        .threaded = .{ .pool_threads = 16 },
+    \\    },
     \\    .vhosts = .{},
     \\    .default_backends = null,
     \\}
@@ -83,7 +113,18 @@ pub fn writeDefaultConfig(init: Init, path: []const u8) !void {
 pub fn printConfig(config: Config, stdio: *StdIo) !void {
     try stdio.println(".{{", .{});
     try stdio.println("\t.listen: {d},", .{config.listen});
-    try stdio.println("\t.vhosts: \n\t.{{", .{});
+    try stdio.println("\t.server: .{{", .{});
+    try stdio.println("\t\t.kind: .{s},", .{@tagName(config.server.kind)});
+    try stdio.println(
+        "\t\t.threaded: .{{.pool_threads: {d}, .client_keepalive: {}, .backend_keepalive: {}, .chunked_requests: {}}},\n\t}},\n\t.vhosts: ",
+        .{
+            config.server.threaded.pool_threads,
+            config.server.threaded.client_keepalive,
+            config.server.threaded.backend_keepalive,
+            config.server.threaded.chunked_requests,
+        },
+    );
+    try stdio.println("\t.{{", .{});
     for (config.vhosts) |vhost| {
         try stdio.print("\t\t.{{\n\t\t\t.hostnames: .{{", .{});
         for (vhost.hostnames) |hostname| {

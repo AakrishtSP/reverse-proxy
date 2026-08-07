@@ -61,7 +61,8 @@ const Balancer = @import("../balancer.zig").Balancer;
 
 const max_request_head = 8192;
 const max_response_head = 8192;
-const pool_threads = 16;
+
+const ThreadedConfig = @import("../config.zig").ThreadedConfig;
 
 /// std.posix.{socket,bind,listen,accept,connect} were removed in 0.16
 /// (moved into std.Io.net's vtable). We already can't route through
@@ -107,7 +108,11 @@ fn sysWrite(fd: posix.fd_t, buf: []const u8) !usize {
     return rc;
 }
 
-pub fn run(allocator: std.mem.Allocator, router: *Router, port: u16) !void {
+fn enableTcpNoDelay(fd: posix.fd_t) void {
+    posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1))) catch {};
+}
+
+pub fn run(allocator: std.mem.Allocator, router: *Router, port: u16, opts: ThreadedConfig) !void {
     // write() to a socket whose peer already closed raises SIGPIPE, and the
     // default action for that is to kill the whole process — not just the
     // thread doing the write. Ignore it so those writes just fail with
@@ -144,19 +149,19 @@ pub fn run(allocator: std.mem.Allocator, router: *Router, port: u16) !void {
     try check(linux.bind(listen_fd, @ptrCast(&bind_addr), @sizeOf(posix.sockaddr.in6)));
     try check(linux.listen(listen_fd, 128));
 
-    // Take pool_threads - 1 slots from worker threads; this (main) thread
+    // Take opts.pool_threads - 1 slots from worker threads; this (main) thread
     // becomes the last worker. Keeps run() blocking forever like the old
     // single accept-loop did, and there's nothing useful for main to do
     // besides pull its share of connections.
-    for (0..pool_threads - 1) |_| {
-        _ = std.Thread.spawn(.{}, workerLoop, .{ allocator, router, listen_fd }) catch |err| {
+    for (0..opts.pool_threads - 1) |_| {
+        _ = std.Thread.spawn(.{}, workerLoop, .{ allocator, router, listen_fd, opts }) catch |err| {
             std.debug.print("thread spawn failed: {any}\n", .{err});
         };
     }
-    workerLoop(allocator, router, listen_fd);
+    workerLoop(allocator, router, listen_fd, opts);
 }
 
-fn workerLoop(allocator: std.mem.Allocator, router: *Router, listen_fd: posix.fd_t) void {
+fn workerLoop(allocator: std.mem.Allocator, router: *Router, listen_fd: posix.fd_t, opts: ThreadedConfig) void {
     while (true) {
         var peer: posix.sockaddr.in6 = undefined;
         var peer_len: posix.socklen_t = @sizeOf(posix.sockaddr.in6);
@@ -164,11 +169,12 @@ fn workerLoop(allocator: std.mem.Allocator, router: *Router, listen_fd: posix.fd
             std.debug.print("accept failed: {any}\n", .{err});
             continue;
         };
-        handleConnection(allocator, router, conn_fd, peer);
+        enableTcpNoDelay(conn_fd);
+        handleConnection(allocator, router, conn_fd, peer, opts);
     }
 }
 
-fn handleConnection(allocator: std.mem.Allocator, router: *Router, conn_fd: posix.fd_t, peer: posix.sockaddr.in6) void {
+fn handleConnection(allocator: std.mem.Allocator, router: *Router, conn_fd: posix.fd_t, peer: posix.sockaddr.in6, opts: ThreadedConfig) void {
     defer sysClose(conn_fd);
 
     // Keep-alive loop: read one request, forward it, and only close when the
@@ -217,11 +223,20 @@ fn handleConnection(allocator: std.mem.Allocator, router: *Router, conn_fd: posi
         };
         const bal = router.route(hostOnly(host_header)) orelse return; // nginx `return 444`-style: deny by closing, no response
 
-        const keep_alive = forward(allocator, bal, conn_fd, peer, req, &buf, &start, &end, &backend) catch |err| {
+        // Chunked request bodies are relayable only when the config enables
+        // that path; otherwise reject before touching the backend.
+        if (req.chunked and !opts.chunked_requests) {
+            sendSimple(conn_fd, "415 Unsupported Media Type");
+            return;
+        }
+
+        const keep_alive = forward(allocator, bal, conn_fd, peer, req, &buf, &start, &end, &backend, opts) catch |err| {
             std.debug.print("proxy error: {any}\n", .{err});
             return; // any error tears the whole connection down
         };
-        if (!keep_alive) return;
+        // Close after this response when the client asked to, the framing
+        // can't be kept unambiguous, or config says never keep the client alive.
+        if (!keep_alive or !opts.client_keepalive) return;
 
         // Slide the unconsumed tail (pipelined next request) to the front for
         // the next iteration.
@@ -242,6 +257,7 @@ fn forward(
     start: *usize,
     end: *usize,
     backend_opt: *?posix.fd_t,
+    opts: ThreadedConfig,
 ) !bool {
     _ = allocator; // not needed yet — everything here is fixed-size buffers
 
@@ -276,11 +292,13 @@ fn forward(
         head_len += (try std.fmt.bufPrint(head[head_len..], "Transfer-Encoding: chunked\r\n", .{})).len;
     }
     // Only ask the backend to keep the socket alive (and thus pay the reuse
-    // bookkeeping) when the client is actually going to reuse this connection.
+    // bookkeeping) when the client is actually going to reuse this connection
+    // AND the config allows backend keep-alive.
     // ponytail: for a Connection: close client every request is one-shot, so
     // requesting keep-alive here adds backend overhead with no reuse payoff —
     // nginx measured 2.5x slower under such a workload than sending close.
-    head_len += (try std.fmt.bufPrint(head[head_len..], "Connection: {s}\r\n\r\n", .{if (req.keep_alive) "keep-alive" else "close"})).len;
+    const backend_keepalive = req.keep_alive and opts.backend_keepalive;
+    head_len += (try std.fmt.bufPrint(head[head_len..], "Connection: {s}\r\n\r\n", .{if (backend_keepalive) "keep-alive" else "close"})).len;
 
     // A reused backend may have gone stale while idle (peer closed it, e.g.
     // its own keep-alive timeout fired). A write to a closed-but-buffered
@@ -320,8 +338,8 @@ fn forward(
         }
     }
 
-    const res = try relayResponse(client_fd, backend_fd, req);
-    if (res.backend_keep and req.keep_alive) {
+    const res = try relayResponse(client_fd, backend_fd, req, opts.client_keepalive);
+    if (res.backend_keep and backend_keepalive) {
         backend_opt.* = backend_fd; // hand the socket back for the next request
     } else {
         sysClose(backend_fd);
@@ -381,7 +399,7 @@ const RelayResult = struct {
 /// EOF-framed body, an early close, or a response Connection: close all drop
 /// the socket. The client verdict additionally requires explicit framing —
 /// a client can't delimit a close-delimited body either.
-fn relayResponse(client_fd: posix.fd_t, backend_fd: posix.fd_t, req: Request) !RelayResult {
+fn relayResponse(client_fd: posix.fd_t, backend_fd: posix.fd_t, req: Request, client_keepalive: bool) !RelayResult {
     var hbuf: [max_response_head]u8 = undefined;
     var hlen: usize = 0;
     var term: ?usize = null;
@@ -423,7 +441,7 @@ fn relayResponse(client_fd: posix.fd_t, backend_fd: posix.fd_t, req: Request) !R
     }
 
     const has_framing = content_length != null or chunked_te;
-    const client_keep = req.keep_alive and has_framing;
+    const client_keep = req.keep_alive and client_keepalive and has_framing;
     out_len += (try std.fmt.bufPrint(
         out[out_len..],
         "Connection: {s}\r\n\r\n",
@@ -522,10 +540,13 @@ fn statusHasNoBody(status_line: []const u8) bool {
 }
 
 fn connectTo(addr: net.IpAddress) !posix.fd_t {
+    // Disable Nagle on backend sockets: small keep-alive requests otherwise
+    // stall ~40ms against the peer's delayed ACK. nginx does the same.
     switch (addr) {
         .ip4 => |ip4| {
             const fd = try sysSocket(posix.AF.INET, posix.SOCK.STREAM, posix.IPPROTO.TCP);
             errdefer sysClose(fd);
+            enableTcpNoDelay(fd);
             const sa: posix.sockaddr.in = .{
                 .family = posix.AF.INET,
                 .port = std.mem.nativeToBig(u16, ip4.port),
@@ -538,6 +559,7 @@ fn connectTo(addr: net.IpAddress) !posix.fd_t {
         .ip6 => |ip6| {
             const fd = try sysSocket(posix.AF.INET6, posix.SOCK.STREAM, posix.IPPROTO.TCP);
             errdefer sysClose(fd);
+            enableTcpNoDelay(fd);
             const sa: posix.sockaddr.in6 = .{
                 .family = posix.AF.INET6,
                 .port = std.mem.nativeToBig(u16, ip6.port),

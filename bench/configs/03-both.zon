@@ -1,0 +1,14 @@
+.{
+    .listen = 8880,
+    .server = .{
+        .kind = .threaded,
+        .threaded = .{
+            .pool_threads = 16,
+            .client_keepalive = true,
+            .backend_keepalive = true,
+            .chunked_requests = true,
+        },
+    },
+    .vhosts = .{},
+    .default_backends = .{"127.0.0.1:8888"},
+}
