@@ -116,6 +116,15 @@ text = open(sys.argv[1]).read()
 def num(pat, cast=float, default=None):
     m = re.search(pat, text)
     return cast(m.group(1)) if m else default
+# wrk prints the `-L` latency percentiles in the largest fitting unit: "us" for
+# fast keep-alive runs, "ms" once latency crosses ~<1ms. Normalize everything
+# to ms so a column means one thing regardless of load.
+def pct_ms(pat):
+    m = re.search(pat, text)
+    if not m:
+        return None
+    val, unit = float(m.group(1)), m.group(2)
+    return val * {"us": 1e-3, "ms": 1.0, "s": 1e3}.get(unit, 1.0)
 row = {
     "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
     "stage": sys.argv[2],
@@ -127,10 +136,10 @@ row = {
     "duration": sys.argv[8],
     "repeat": int(sys.argv[9]),
     "req_per_sec": num(r"Requests/sec:\s+([\d.]+)"),
-    "p50_ms": num(r"50%\s+([\d.]+)ms"),
-    "p75_ms": num(r"75%\s+([\d.]+)ms"),
-    "p90_ms": num(r"90%\s+([\d.]+)ms"),
-    "p99_ms": num(r"99%\s+([\d.]+)ms"),
+    "p50_ms": pct_ms(r"50%\s+([\d.]+)\s*(us|ms|s)\b"),
+    "p75_ms": pct_ms(r"75%\s+([\d.]+)\s*(us|ms|s)\b"),
+    "p90_ms": pct_ms(r"90%\s+([\d.]+)\s*(us|ms|s)\b"),
+    "p99_ms": pct_ms(r"99%\s+([\d.]+)\s*(us|ms|s)\b"),
 }
 print(json.dumps(row))
 PY
