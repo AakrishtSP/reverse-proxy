@@ -29,7 +29,7 @@ ensure_proxy() {
 ensure_backend() {
     mkdir -p "$TMP"
     command -v cc >/dev/null || { echo "cc not on PATH (needed to build the C backend)" >&2; exit 1; }
-    cc -O2 -o "$BACKEND_BIN" "$BENCH_DIR/backend.c" \
+    cc -O2 -o "$BACKEND_BIN" "$BENCH_DIR/backend.c" -luring -lpthread \
         || { echo "failed to build C backend" >&2; exit 1; }
 }
 

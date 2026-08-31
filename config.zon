@@ -1,18 +1,32 @@
 .{
     .listen = 8880,
     .server = .{
-        .kind = .epoll,
+        .kind = .io_uring,
+        .threaded = .{
+            .pool_threads = 16,
+            .client_keepalive = true,
+            .backend_keepalive = true,
+            .chunked_requests = true,
+        },
         .epoll = .{
             .client_keepalive = true,
             .backend_keepalive = true,
             .chunked_requests = true,
             .pool_size = 100,
+            .loops = 16,
+        },
+        .io_uring = .{
+            .client_keepalive = true,
         },
     },
     .vhosts = .{
         .{
-            .hostnames = .{"jellyfin.internal"},
-            .backends = .{"127.0.0.1:8000"},
+            .hostnames = .{"apple.com"},
+            .backends = .{ "127.0.0.1:8000", "127.0.0.1:8080" },
+        },
+        .{
+            .hostnames = .{"orange.com"},
+            .backends = .{ "127.0.0.1:8800", "127.0.0.1:8088" },
         },
     },
     .default_backends = .{"127.0.0.1:8888"},

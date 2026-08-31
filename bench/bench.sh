@@ -46,9 +46,11 @@ for mode in open close; do
     echo "  mode=$mode  url=$TARGET_URL  conns=$CONNECTIONS  threads=$THREADS"
     echo "======================================================"
     if [ "$mode" = close ]; then
+        echo wrk -t"$THREADS" -c"$CONNECTIONS" -d"$DURATION" -H "Connection: close" "$TARGET_URL"
         wrk -t"$THREADS" -c"$CONNECTIONS" -d"$DURATION" -H "Connection: close" "$TARGET_URL"
     else
         # open is the default wrk behaviour (keep-alive)
+        echo wrk -t"$THREADS" -c"$CONNECTIONS" -d"$DURATION" "$TARGET_URL"
         wrk -t"$THREADS" -c"$CONNECTIONS" -d"$DURATION" "$TARGET_URL"
     fi
 done
