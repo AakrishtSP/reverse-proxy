@@ -52,7 +52,11 @@ NGINX_CONF="$TMP/nginx-proxy.conf"
 NGINX_PID="$TMP/nginx-proxy.pid"
 NGINX_PORT=8885
 DURATION="${HARNESS_DURATION:-10s}"
-WRK_THREADS=4
+# Load-generator threads. 4 under-drives the proxy past ~6M req/s (measured:
+# -t8 raised c200 open 5.9M -> 8.4M on 16 cores); -t16 oversubscribed and
+# regressed. Override per machine, e.g. WRK_THREADS=8. Rows record the value
+# in wrk_threads so runs stay comparable.
+WRK_THREADS="${WRK_THREADS:-4}"
 : "${WRK_ARGS:=-L}"
 
 CONFIGS=()

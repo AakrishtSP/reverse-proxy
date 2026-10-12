@@ -75,9 +75,10 @@ bodies with 415). See `bench/configs/` for ready-made examples per kind
 ## Backend
 
 Benchmarks need an upstream. The bench fixture is a small C HTTP/1.1 server
-(`bench/backend.c`, an epoll server answering `PONG!` on `:8888`) that is
-multi-threaded — one `SO_REUSEPORT` listener per CPU — so it stops being the
-throughput wall:
+(`bench/backend.c`, an io_uring multishot server answering `PONG!` on
+`:8888`) that is multi-threaded — one `SO_REUSEPORT` listener per CPU — so
+it stops being the throughput wall (measured idle-ish while the proxy does
+8M+ req/s through it):
 
 ```bash
 cc -O2 -o bench/tmp/backend bench/backend.c -lpthread

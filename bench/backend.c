@@ -3,6 +3,7 @@
 // accept
 #include <liburing.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -100,6 +101,11 @@ static void *worker(void *arg) {
           if (!nc) {
             close(cqe->res);
           } else {
+            // Disable Nagle: tiny request/response ping-pong stalls ~40ms
+            // against delayed ACK otherwise (invisible on loopback, fatal
+            // across a NIC).
+            int one = 1;
+            setsockopt(cqe->res, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
             nc->fd = cqe->res;
             nc->send_off = 0;
             arm_recv(&ring, nc);
