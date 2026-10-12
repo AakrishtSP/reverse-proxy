@@ -7,7 +7,9 @@ fair comparison:
 - `threaded` — fixed pool of blocking worker threads
 - `epoll` — single-threaded event loop, optionally N independent `SO_REUSEPORT`
   loops via `epoll.loops`
-- `io_uring` — single-threaded ring loop (async accept/recv/send/connect)
+- `io_uring` — ring loop(s), one op in flight per connection (async
+  accept/recv/send/connect), optionally N independent `SO_REUSEPORT` loops
+  via `io_uring.loops` with a shared-per-loop backend connection pool
 
 Pick one via `config.zon`'s `.server.kind`.
 
@@ -63,10 +65,12 @@ Requests are routed by the `Host` header against `vhosts[].hostnames`
 no response (nginx `return 444`-style deny).
 
 `.server` holds a `kind` plus per-kind options (`threaded.pool_threads`,
-`epoll.loops` / `pool_size` / `max_connections`, `io_uring.entries`). Every
+`epoll.loops` / `pool_size` / `max_connections`, `io_uring.loops` /
+`pool_size` / `max_connections` / `entries`). Every
 kind shares `client_keepalive`, `backend_keepalive`, and `chunked_requests`
 (`io_uring` serves `chunked_requests = false` for now and rejects chunked
-bodies with 415). See `bench/configs/` for ready-made examples per kind.
+bodies with 415). See `bench/configs/` for ready-made examples per kind
+(`22-io-uring-loops-8` is the fast io_uring setup: pooled backends × 8 loops).
 
 ## Backend
 

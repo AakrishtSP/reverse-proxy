@@ -91,8 +91,10 @@ Implemented as `ServerConfig.kind = .io_uring` (not a retrofit to epoll):
 | epoll 4 loops | ~59k | ~116k |
 
 A single io_uring loop beats all prior servers in both modes. (Numbers move
-with wrk concurrency/threads; the ordering holds.) Not yet: chunked/streaming,
-backend keep-alive reuse, multi-loop SO_REUSEPORT for io_uring.
+with wrk concurrency/threads; the ordering holds.) Done since: backend
+keep-alive pool (`pool_size`, shared per loop) and SO_REUSEPORT multi-loop
+(`loops`, with `max_connections` and ring `entries` partitioned per loop) —
+see `bench/configs/22-io-uring-loops-8.zon`. Not yet: chunked/streaming.
 
 ### 3. threaded: polish only (low ROI)
 

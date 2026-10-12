@@ -52,6 +52,8 @@ const Conn = struct {
     backend_addr: net.IpAddress = undefined,
     backend_sa: Sockaddr = undefined,
     backend_sa_len: posix.socklen_t = 0,
+    pooled_socket: bool = false, // backend came from the pool (stale-retry allowed)
+    stale_retried: bool = false,
 
     state: State = .read_head,
 
@@ -77,6 +79,7 @@ const Conn = struct {
     resp_head_done: bool = false,
     resp_cl: ?u64 = null,
     resp_close_framed: bool = false, // no framing -> read to EOF
+    resp_conn_close: bool = false, // backend asked to close -> don't pool
 };
 
 const ConnPool = struct {
@@ -85,9 +88,11 @@ const ConnPool = struct {
     top: usize = 0,
 
     fn init(allocator: std.mem.Allocator, n: usize) !ConnPool {
+        const slots = try allocator.alloc(Conn, n);
+        errdefer allocator.free(slots);
         const free = try allocator.alloc(usize, n);
         var pool = ConnPool{
-            .slots = try allocator.alloc(Conn, n),
+            .slots = slots,
             .free = free,
         };
         var i: usize = 0;
@@ -114,11 +119,50 @@ const ConnPool = struct {
     }
 };
 
+/// Shared pool of idle keep-alive backend sockets, borrowed per request and
+/// returned at a clean framing boundary. Single-threaded loop, no locking.
+const Pool = struct {
+    allocator: std.mem.Allocator,
+    items: std.ArrayListUnmanaged(Item) = .empty,
+    cap: usize,
+
+    const Item = struct { fd: posix.fd_t, addr: net.IpAddress };
+
+    fn init(allocator: std.mem.Allocator, cap: usize) Pool {
+        return .{ .allocator = allocator, .cap = cap };
+    }
+
+    fn borrow(self: *Pool, addr: net.IpAddress) ?posix.fd_t {
+        var i = self.items.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (std.meta.eql(self.items.items[i].addr, addr)) {
+                return self.items.swapRemove(i).fd;
+            }
+        }
+        return null;
+    }
+
+    fn release(self: *Pool, fd: posix.fd_t, addr: net.IpAddress) void {
+        if (self.items.items.len >= self.cap) {
+            sysClose(fd);
+            return;
+        }
+        self.items.append(self.allocator, .{ .fd = fd, .addr = addr }) catch sysClose(fd);
+    }
+
+    fn deinit(self: *Pool) void {
+        for (self.items.items) |it| sysClose(it.fd);
+        self.items.deinit(self.allocator);
+    }
+};
+
 const Loop = struct {
     ring: linux.IoUring,
     router: *Router,
     listen_fd: posix.fd_t,
     conns: ConnPool,
+    pool: Pool,
     opts: IoUringConfig,
 
     // ---- submit helpers (each queues one op; flushed by run's main loop) ----
@@ -233,7 +277,23 @@ const Loop = struct {
         }).pick();
 
 conn.backend_sa_len = buildSockaddr(conn.backend_addr, &conn.backend_sa);
-    conn.backend = sysOpenBackend(conn.backend_sa_len) catch |err| {
+        // Reuse an idle pooled backend when allowed; otherwise open fresh.
+        // A pooled socket the backend idle-closed is detected on the first
+        // send and reconnected once (see opSendReq) — but only when nothing
+        // of the request has gone out yet.
+        if (self.opts.backend_keepalive) {
+            if (self.pool.borrow(conn.backend_addr)) |fd| {
+                conn.backend = fd;
+                conn.pooled_socket = true;
+                conn.stale_retried = false;
+                conn.state = .send_req;
+                self.submitSend(conn, fd, conn.head[0..conn.head_end]);
+                return;
+            }
+        }
+        conn.pooled_socket = false;
+        conn.stale_retried = false;
+        conn.backend = sysOpenBackend(conn.backend_sa_len) catch |err| {
             log.fmt("connect failed: {any}", .{err});
             self.sendSimple(conn, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
             return;
@@ -243,14 +303,17 @@ conn.backend_sa_len = buildSockaddr(conn.backend_addr, &conn.backend_sa);
     }
 
     fn buildHead(self: *Loop, conn: *Conn, req: Request) !void {
-        _ = self;
         var h: usize = 0;
         h += (try std.fmt.bufPrint(conn.head[h..], "{s} {s} HTTP/1.1\r\n", .{ req.method, req.target })).len;
         for (req.headers) |hd| {
             if (std.ascii.eqlIgnoreCase(hd.name, "x-forwarded-for")) continue;
             h += (try std.fmt.bufPrint(conn.head[h..], "{s}: {s}\r\n", .{ hd.name, hd.value })).len;
         }
-        h += (try std.fmt.bufPrint(conn.head[h..], "Connection: close\r\n\r\n", .{})).len;
+        // Ask the backend to keep the socket alive only when the pool will
+        // actually reuse it; otherwise every request pays idle-socket
+        // bookkeeping on both ends for no payoff.
+        const keep_backend = self.opts.backend_keepalive;
+        h += (try std.fmt.bufPrint(conn.head[h..], "Connection: {s}\r\n\r\n", .{if (keep_backend) "keep-alive" else "close"})).len;
         conn.head_end = h;
         conn.head_sent = 0;
     }
@@ -267,7 +330,7 @@ conn.backend_sa_len = buildSockaddr(conn.backend_addr, &conn.backend_sa);
 
     fn opSendReq(self: *Loop, conn: *Conn, res: i32) void {
         if (res < 0) {
-            self.teardown(conn);
+            self.handleSendError(conn);
             return;
         }
         conn.head_sent += @intCast(res);
@@ -290,6 +353,26 @@ conn.backend_sa_len = buildSockaddr(conn.backend_addr, &conn.backend_sa);
         }
         conn.state = .read_body;
         self.submitRecv(conn, conn.client, conn.inbox[conn.in_end..]);
+    }
+
+    /// Stale pooled socket: the backend closed it while idle. Reconnect and
+    /// re-send only when nothing of the request has gone out yet (the usual
+    /// idle-close case, and the only one where re-sending is well-defined).
+    fn handleSendError(self: *Loop, conn: *Conn) void {
+        if (conn.pooled_socket and !conn.stale_retried and conn.head_sent == 0) {
+            conn.stale_retried = true;
+            if (conn.backend) |fd| sysClose(fd);
+            conn.backend = sysOpenBackend(conn.backend_sa_len) catch {
+                self.teardown(conn);
+                return;
+            };
+            conn.pooled_socket = false;
+            conn.head_sent = 0;
+            conn.state = .connecting;
+            self.submitConnect(conn);
+            return;
+        }
+        self.teardown(conn);
     }
 
     fn opSendBody(self: *Loop, conn: *Conn, res: i32) void {
@@ -363,8 +446,9 @@ conn.backend_sa_len = buildSockaddr(conn.backend_addr, &conn.backend_sa);
             conn.resp_head_end = head + 4;
             conn.resp_cl = parseContentLength(conn.resp[0..conn.resp_head_end]);
             // close-framed when no Content-Length, or an explicit Connection: close
-            conn.resp_close_framed = conn.resp_cl == null or
+            conn.resp_conn_close =
                 indexOfHeaderValue(conn.resp[0..conn.resp_head_end], "connection", "close");
+            conn.resp_close_framed = conn.resp_cl == null or conn.resp_conn_close;
             conn.resp_head_done = true;
             conn.resp_sent = 0;
             if (!conn.resp_close_framed and conn.client_keep) {
@@ -411,6 +495,20 @@ conn.backend_sa_len = buildSockaddr(conn.backend_addr, &conn.backend_sa);
     }
 
     fn nextRequest(self: *Loop, conn: *Conn) void {
+        // Backend socket: pool it when the response was cleanly framed and
+        // the backend didn't ask to close; otherwise drop it. Either way it
+        // no longer belongs to this client connection past this point.
+        if (conn.backend) |fd| {
+            if (self.opts.backend_keepalive and !conn.resp_conn_close) {
+                self.pool.release(fd, conn.backend_addr);
+            } else {
+                sysClose(fd);
+            }
+            conn.backend = null;
+        }
+        conn.pooled_socket = false;
+        conn.stale_retried = false;
+        conn.resp_conn_close = false;
         if (!conn.client_keep) {
             self.teardown(conn);
             return;
@@ -571,13 +669,44 @@ pub fn run(allocator: std.mem.Allocator, router: *Router, port: u16, opts: IoUri
     };
     posix.sigaction(posix.SIG.PIPE, &sigpipe_action, null);
 
-    var ring = try linux.IoUring.init(opts.entries, 0);
+    // N independent event loops, each with its own SO_REUSEPORT listener,
+    // ring, ConnPool partition and backend pool, so the single-core ceiling
+    // scales across cores. The calling thread runs the last loop so run()
+    // blocks forever.
+    const n = @max(@as(usize, 1), opts.loops);
+    for (0..n - 1) |_| {
+        _ = std.Thread.spawn(.{}, loopWorker, .{ allocator, router, port, opts }) catch |err| {
+            log.fmt("io_uring loop spawn failed: {any}", .{err});
+        };
+    }
+    loopWorker(allocator, router, port, opts);
+}
+
+fn loopWorker(allocator: std.mem.Allocator, router: *Router, port: u16, opts: IoUringConfig) void {
+    const nloops = @max(@as(usize, 1), opts.loops);
+
+    // Ring depth is partitioned across loops (halved per doubling, floored
+    // at 64) so N loops pin ~the same locked memory (RLIMIT_MEMLOCK) as one
+    // loop; IoUring.init requires a power of two, which halving preserves.
+    var per_loop_entries: u16 = opts.entries;
+    var remaining = nloops;
+    while (remaining > 1) : (remaining /= 2) per_loop_entries /= 2;
+    per_loop_entries = @max(per_loop_entries, 64);
+
+    var ring = linux.IoUring.init(per_loop_entries, 0) catch |err| {
+        log.fmt("io_uring init failed: {any}", .{err});
+        return;
+    };
     defer ring.deinit();
 
-    const listen_fd = try sysSocket(posix.AF.INET6, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, posix.IPPROTO.TCP);
+    const listen_fd = sysSocket(posix.AF.INET6, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, posix.IPPROTO.TCP) catch |err| {
+        log.fmt("socket failed: {any}", .{err});
+        return;
+    };
     defer sysClose(listen_fd);
-    try posix.setsockopt(listen_fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
-    try posix.setsockopt(listen_fd, posix.IPPROTO.IPV6, posix.IPV6.V6ONLY, &std.mem.toBytes(@as(c_int, 0)));
+    posix.setsockopt(listen_fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1))) catch {};
+    posix.setsockopt(listen_fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, &std.mem.toBytes(@as(c_int, 1))) catch {};
+    posix.setsockopt(listen_fd, posix.IPPROTO.IPV6, posix.IPV6.V6ONLY, &std.mem.toBytes(@as(c_int, 0))) catch {};
 
     const bind_addr: posix.sockaddr.in6 = .{
         .family = posix.AF.INET6,
@@ -586,15 +715,20 @@ pub fn run(allocator: std.mem.Allocator, router: *Router, port: u16, opts: IoUri
         .addr = [_]u8{0} ** 16,
         .scope_id = 0,
     };
-    try check(linux.bind(listen_fd, @ptrCast(&bind_addr), @sizeOf(posix.sockaddr.in6)));
-    try check(linux.listen(listen_fd, 4096));
+    check(linux.bind(listen_fd, @ptrCast(&bind_addr), @sizeOf(posix.sockaddr.in6))) catch return;
+    check(linux.listen(listen_fd, 4096)) catch return;
 
-    var conns = try ConnPool.init(allocator, 1024);
+    // Total budgets split across loops; each loop refuses accepts / pools
+    // within its own share (lock-free; remainder is dropped).
+    var conns = ConnPool.init(allocator, @max(@as(usize, 1), opts.max_connections / nloops)) catch return;
     defer conns.deinit(allocator);
 
-    var loop = Loop{ .ring = ring, .router = router, .listen_fd = listen_fd, .conns = conns, .opts = opts };
+    var pool = Pool.init(allocator, @max(@as(usize, 1), opts.pool_size / nloops));
+    defer pool.deinit();
+
+    var loop = Loop{ .ring = ring, .router = router, .listen_fd = listen_fd, .conns = conns, .pool = pool, .opts = opts };
     loop.submitAccept();
-    _ = try loop.ring.submit();
+    _ = loop.ring.submit() catch {};
 
     var cqes: [256]linux.io_uring_cqe = undefined;
     while (true) {

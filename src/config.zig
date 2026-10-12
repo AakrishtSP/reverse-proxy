@@ -54,13 +54,25 @@ pub const IoUringConfig = struct {
     /// Keep the client connection alive across requests when the client asks
     /// for it and the response framing allows it.
     client_keepalive: bool = true,
-    /// Keep the backend connection alive across requests. Minimal first cut
-    /// always asks the backend to close and connects fresh per request, so this
-    /// is accepted but not yet used.
+    /// Reuse backend connections across requests via the shared pool. When
+    /// false, every request gets a fresh backend connection (asked to close).
     backend_keepalive: bool = true,
     /// Relay chunked (Transfer-Encoding: chunked) request bodies. The minimal
     /// io_uring server rejects chunked requests with 415.
     chunked_requests: bool = false,
+    /// Max idle backend sockets the pool will keep open. Beyond this, returned
+    /// connections are closed instead of pooled.
+    pool_size: usize = 100,
+    /// Fixed number of preallocated client connections (in-flight requests).
+    /// Each slot owns its read/write buffers, so this bounds heap usage up
+    /// front. When exhausted, new connections are refused until a slot frees.
+    /// With `loops > 1` this total is split evenly across the loops.
+    max_connections: usize = 1024,
+    /// Number of independent io_uring event loops. Each loop owns its own
+    /// SO_REUSEPORT listener, ring, ConnPool partition and backend pool, so
+    /// the single-core ceiling scales across cores. `1` is the classic
+    /// single-loop server.
+    loops: usize = 1,
     /// io_uring submission/completion queue depth (power of two).
     entries: u16 = 4096,
 };
@@ -100,6 +112,9 @@ const default_config_zon =
     \\            .client_keepalive = true,
     \\            .backend_keepalive = true,
     \\            .chunked_requests = false,
+    \\            .pool_size = 100,
+    \\            .max_connections = 1024,
+    \\            .loops = 1,
     \\            .entries = 4096,
     \\        },
     \\    },
@@ -173,7 +188,7 @@ pub fn printConfig(config: Config, stdio: *StdIo) !void {
     try stdio.println("\t.server: .{{", .{});
     try stdio.println("\t\t.kind: .{s},", .{@tagName(config.server.kind)});
     try stdio.println(
-        "\t\t.threaded: .{{.pool_threads: {d}, .client_keepalive: {}, .backend_keepalive: {}, .chunked_requests: {}}},\n\t\t.epoll: .{{.client_keepalive: {}, .backend_keepalive: {}, .chunked_requests: {}, .pool_size: {d}, .max_connections: {d}, .loops: {d}}},\n\t\t.io_uring: .{{.client_keepalive: {}, .backend_keepalive: {}, .chunked_requests: {}, .entries: {d}}},\n\t}},\n\t.vhosts: ",
+        "\t\t.threaded: .{{.pool_threads: {d}, .client_keepalive: {}, .backend_keepalive: {}, .chunked_requests: {}}},\n\t\t.epoll: .{{.client_keepalive: {}, .backend_keepalive: {}, .chunked_requests: {}, .pool_size: {d}, .max_connections: {d}, .loops: {d}}},\n\t\t.io_uring: .{{.client_keepalive: {}, .backend_keepalive: {}, .chunked_requests: {}, .pool_size: {d}, .max_connections: {d}, .loops: {d}, .entries: {d}}},\n\t}},\n\t.vhosts: ",
         .{
             config.server.threaded.pool_threads,
             config.server.threaded.client_keepalive,
@@ -188,6 +203,9 @@ pub fn printConfig(config: Config, stdio: *StdIo) !void {
             config.server.io_uring.client_keepalive,
             config.server.io_uring.backend_keepalive,
             config.server.io_uring.chunked_requests,
+            config.server.io_uring.pool_size,
+            config.server.io_uring.max_connections,
+            config.server.io_uring.loops,
             config.server.io_uring.entries,
         },
     );
