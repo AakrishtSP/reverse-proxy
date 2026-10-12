@@ -79,7 +79,10 @@ static void *worker(void *arg) {
   // async internally so O_NONBLOCK (needed for epoll) isn't required here.
 
   struct io_uring ring;
-  if (io_uring_queue_init(4096, &ring, 0) < 0) {
+  // 1024 entries/worker: in-flight depth here is a handful of ops (one
+  // recv+send per connection); depth only costs pinned memory
+  // (RLIMIT_MEMLOCK, shared with the proxy under test), not throughput.
+  if (io_uring_queue_init(1024, &ring, 0) < 0) {
     perror("io_uring_queue_init");
     return NULL;
   }

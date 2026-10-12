@@ -66,8 +66,9 @@ pub const IoUringConfig = struct {
     /// Fixed number of preallocated client connections (in-flight requests).
     /// Each slot owns its read/write buffers, so this bounds heap usage up
     /// front. When exhausted, new connections are refused until a slot frees.
-    /// With `loops > 1` this total is split evenly across the loops.
-    max_connections: usize = 1024,
+    /// With `loops > 1` this total is split evenly across the loops, so size
+    /// it for loops × expected per-loop concurrency.
+    max_connections: usize = 8192,
     /// Number of independent io_uring event loops. Each loop owns its own
     /// SO_REUSEPORT listener, ring, ConnPool partition and backend pool, so
     /// the single-core ceiling scales across cores. `1` is the classic
@@ -117,7 +118,7 @@ const default_config_zon =
     \\            .backend_keepalive = true,
     \\            .chunked_requests = false,
     \\            .pool_size = 100,
-    \\            .max_connections = 1024,
+    \\            .max_connections = 8192,
     \\            .loops = 1,
     \\            .sqpoll = false,
     \\            .entries = 4096,

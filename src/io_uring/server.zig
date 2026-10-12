@@ -28,7 +28,17 @@ const log = @import("../log.zig");
 
 const buf_size = 8192;
 const resp_buf_size = 65536;
-const acceptable_magic: u64 = 0; // user_data for the pending accept op
+// user_data for the pending accept op. All-ones: a connection tag always
+// carries a small slot index in its low 32 bits, so this never collides.
+const acceptable_magic: u64 = std.math.maxInt(u64);
+// Cap on consecutive -EAGAIN reissues of one op before the connection is
+// dropped: a transiently-full socket buffer clears in a few spins (~100ns
+// each); a peer that never becomes ready must not pin the loop.
+const max_eagain: u8 = 100;
+
+fn isAgain(res: i32) bool {
+    return res == -@as(i32, @intCast(@intFromEnum(linux.E.AGAIN)));
+}
 
 const State = enum {
     read_head, // client IN: parse a request head
@@ -54,6 +64,10 @@ const Conn = struct {
     backend_sa_len: posix.socklen_t = 0,
     pooled_socket: bool = false, // backend came from the pool (stale-retry allowed)
     stale_retried: bool = false,
+    gen: u32 = 0, // slot generation: stale ring CQEs from a previous
+    // occupant carry an older gen and are ignored on dispatch
+    eagain_streak: u8 = 0, // consecutive -EAGAIN rounds (bounded; see onOp)
+    polling: bool = false, // a readiness POLL_ADD (not an I/O op) is outstanding
 
     state: State = .read_head,
 
@@ -106,15 +120,23 @@ const ConnPool = struct {
         allocator.free(self.slots);
         allocator.free(self.free);
     }
-    fn acquire(self: *ConnPool) ?*Conn {
+    fn acquire(self: *ConnPool) ?usize {
         if (self.top == 0) return null;
         self.top -= 1;
-        return &self.slots[self.free[self.top]];
+        return self.free[self.top];
+    }
+    fn indexOf(self: *ConnPool, conn: *Conn) usize {
+        const base = @intFromPtr(self.slots.ptr);
+        return (@intFromPtr(conn) - base) / @sizeOf(Conn);
+    }
+    /// Ring user_data tag for a slot: generation (high 32) + slot index.
+    /// A CQE arriving after the slot was recycled carries a stale gen and
+    /// is dropped on dispatch instead of corrupting the new occupant.
+    fn tag(self: *ConnPool, conn: *Conn) u64 {
+        return (@as(u64, conn.gen) << 32) | @as(u64, @intCast(self.indexOf(conn)));
     }
     fn release(self: *ConnPool, conn: *Conn) void {
-        const base = @intFromPtr(self.slots.ptr);
-        const idx = (@intFromPtr(conn) - base) / @sizeOf(Conn);
-        self.free[self.top] = idx;
+        self.free[self.top] = self.indexOf(conn);
         self.top += 1;
     }
 };
@@ -172,6 +194,9 @@ const Loop = struct {
     /// One standing multishot accept (pre-5.19 kernels fall back to re-armed
     /// one-shot: see acceptReady). Re-armed by the event loop only when a CQE
     /// arrives without IORING_CQE_F_MORE, i.e. the multishot terminated.
+    /// Sockets stay nonblocking: a momentarily-unready op completes with
+    /// -EAGAIN, which onOp turns into a bounded reissue (see eagain_streak)
+    /// instead of tearing the connection down.
     fn submitAccept(self: *Loop) void {
         const flags = posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK;
         if (self.multishot_ok) {
@@ -186,21 +211,21 @@ const Loop = struct {
     }
 
     fn submitRecv(self: *Loop, conn: *Conn, fd: posix.fd_t, buf: []u8) void {
-        _ = self.ring.recv(@intFromPtr(conn), fd, .{ .buffer = buf }, 0) catch {
+        _ = self.ring.recv(self.conns.tag(conn), fd, .{ .buffer = buf }, 0) catch {
             self.teardown(conn);
             return;
         };
     }
 
     fn submitSend(self: *Loop, conn: *Conn, fd: posix.fd_t, buf: []const u8) void {
-        _ = self.ring.send(@intFromPtr(conn), fd, buf, 0) catch {
+        _ = self.ring.send(self.conns.tag(conn), fd, buf, 0) catch {
             self.teardown(conn);
             return;
         };
     }
 
     fn submitConnect(self: *Loop, conn: *Conn) void {
-        _ = self.ring.connect(@intFromPtr(conn), conn.backend.?, @ptrCast(&conn.backend_sa), conn.backend_sa_len) catch {
+        _ = self.ring.connect(self.conns.tag(conn), conn.backend.?, @ptrCast(&conn.backend_sa), conn.backend_sa_len) catch {
             self.teardown(conn);
             return;
         };
@@ -223,11 +248,17 @@ const Loop = struct {
         }
         self.accept_seen = true;
         const fd: posix.fd_t = @intCast(res);
-        const conn = self.conns.acquire() orelse {
+        const idx = self.conns.acquire() orelse {
             sysClose(fd); // no slots: refuse rather than queue
             return;
         };
+        const conn = &self.conns.slots[idx];
+        // New generation: any ring op still in flight from the slot's
+        // previous occupant dispatches with a stale gen and is ignored.
+        const gen = conn.gen +% 1;
         conn.* = .{ .client = fd };
+        conn.gen = gen;
+        enableTcpNoDelay(fd);
         conn.state = .read_head;
         self.submitRecv(conn, conn.client, conn.inbox[0..]);
     }
@@ -235,6 +266,31 @@ const Loop = struct {
     // ---- per-op dispatch ----
 
     fn onOp(self: *Loop, conn: *Conn, res: i32) void {
+        // Completion of a readiness poll: reissue the op; a poll error means
+        // the fd is gone, so drop the connection.
+        if (conn.polling) {
+            conn.polling = false;
+            if (res < 0) {
+                self.teardown(conn);
+                return;
+            }
+            self.reissue(conn);
+            return;
+        }
+        // Momentarily-unready socket (-EAGAIN on a nonblocking fd): wait for
+        // readiness in the kernel instead of spinning or tearing the
+        // connection down. Bounded by eagain_streak: a peer that never
+        // becomes ready is dropped rather than waited on forever.
+        if (isAgain(res)) {
+            if (conn.eagain_streak >= max_eagain) {
+                self.teardown(conn);
+                return;
+            }
+            conn.eagain_streak += 1;
+            self.pollFor(conn);
+            return;
+        }
+        conn.eagain_streak = 0;
         switch (conn.state) {
             .read_head => self.opReadHead(conn, res),
             .read_body => self.opReadBody(conn, res),
@@ -244,6 +300,52 @@ const Loop = struct {
             .read_resp => self.opReadResp(conn, res),
             .relay => self.opRelay(conn, res),
             .closing => self.teardown(conn),
+        }
+    }
+
+    /// Submits a readiness poll for the op the connection is waiting on. The
+    /// state always describes the outstanding op (see relayProgress), so the
+    /// (fd, direction) pair derives from it. The poll CQE re-arms the op via
+    /// reissue — no userspace spinning in between.
+    fn pollFor(self: *Loop, conn: *Conn) void {
+        const target: struct { fd: posix.fd_t, mask: u32 } = switch (conn.state) {
+            .read_head, .read_body => .{ .fd = conn.client, .mask = linux.POLL.IN },
+            .connecting => .{ .fd = conn.backend.?, .mask = linux.POLL.OUT },
+            .send_req, .send_body => .{ .fd = conn.backend.?, .mask = linux.POLL.OUT },
+            .read_resp => .{ .fd = conn.backend.?, .mask = linux.POLL.IN },
+            .relay => .{ .fd = conn.client, .mask = linux.POLL.OUT },
+            .closing => {
+                self.teardown(conn); // error reply; don't wait, just drop
+                return;
+            },
+        };
+        _ = self.ring.poll_add(self.conns.tag(conn), target.fd, target.mask) catch {
+            self.teardown(conn);
+            return;
+        };
+        conn.polling = true;
+    }
+
+    /// Re-submits the op the connection is currently waiting on, without
+    /// consuming anything: -EAGAIN moved no bytes and changed no state, so
+    /// repeating the last submit is exactly correct. Every branch mirrors
+    /// the submit its state's handler performed.
+    fn reissue(self: *Loop, conn: *Conn) void {
+        switch (conn.state) {
+            .read_head, .read_body => self.submitRecv(conn, conn.client, conn.inbox[conn.in_end..]),
+            .connecting => self.submitConnect(conn),
+            .send_req => self.submitSend(conn, conn.backend.?, conn.head[conn.head_sent..conn.head_end]),
+            .send_body => {
+                if (conn.in_start < conn.in_end) {
+                    const want = @min(conn.body_left, conn.in_end - conn.in_start);
+                    self.submitSend(conn, conn.backend.?, conn.inbox[conn.in_start .. conn.in_start + @as(usize, @intCast(want))]);
+                } else {
+                    self.submitRecv(conn, conn.client, conn.inbox[conn.in_end..]);
+                }
+            },
+            .read_resp => self.submitRecv(conn, conn.backend.?, conn.resp[conn.resp_end..]),
+            .relay => self.relayProgress(conn),
+            .closing => self.teardown(conn), // error reply; don't spin, just drop
         }
     }
 
@@ -477,6 +579,16 @@ conn.backend_sa_len = buildSockaddr(conn.backend_addr, &conn.backend_sa);
                 const old_end = conn.resp_head_end;
                 conn.resp_head_end = dropHeaderLine(conn.resp[0..conn.resp_end], conn.resp_head_end, conn.resp_end, "connection");
                 conn.resp_end -= (old_end - conn.resp_head_end);
+            } else if (!conn.client_keep and conn.resp_cl != null) {
+                // The client connection closes after this response: it must
+                // say so (HTTP/1.1 defaults to keep-alive). Otherwise the
+                // client waits for a next response that never comes and only
+                // learns the truth at EOF.
+                const old_end = conn.resp_head_end;
+                conn.resp_head_end = forceConnectionClose(conn.resp[0..], conn.resp_head_end, conn.resp_end);
+                // Net change can go either way (dropped line vs added line).
+                const delta: isize = @as(isize, @intCast(conn.resp_head_end)) - @as(isize, @intCast(old_end));
+                conn.resp_end = @intCast(@as(isize, @intCast(conn.resp_end)) + delta);
             }
         }
         self.relayProgress(conn);
@@ -492,22 +604,29 @@ conn.backend_sa_len = buildSockaddr(conn.backend_addr, &conn.backend_sa);
     }
 
     /// Send as much buffered response as we have; decide read-more vs done.
+    /// State always describes the outstanding op: .relay while a client send
+    /// is in flight (its CQE must reach opRelay, which advances resp_sent),
+    /// .read_resp while a backend recv is in flight.
     fn relayProgress(self: *Loop, conn: *Conn) void {
         if (conn.resp_close_framed) {
             if (conn.resp_sent < conn.resp_end) {
+                conn.state = .relay;
                 self.submitSend(conn, conn.client, conn.resp[conn.resp_sent..conn.resp_end]);
                 return;
             }
+            conn.state = .read_resp;
             self.submitRecv(conn, conn.backend.?, conn.resp[0..]); // wait for EOF
             return;
         }
         const target: usize = @intCast(conn.resp_head_end + (conn.resp_cl orelse unreachable));
         const have_cl = @min(conn.resp_end, target);
         if (conn.resp_sent < have_cl) {
+            conn.state = .relay;
             self.submitSend(conn, conn.client, conn.resp[conn.resp_sent..have_cl]);
             return;
         }
         if (conn.resp_end < target) {
+            conn.state = .read_resp;
             self.submitRecv(conn, conn.backend.?, conn.resp[conn.resp_end..]);
             return;
         }
@@ -598,6 +717,24 @@ fn indexOfHeaderValue(head: []const u8, name: []const u8, needle: []const u8) bo
     return false;
 }
 
+/// Ensures the buffered head tells the client this connection closes:
+/// drops any Connection line, then appends "Connection: close" *before* the
+/// terminal blank line. `buf` is the whole response buffer (for capacity),
+/// `head_end`/`buf_end` mark the head and the buffered bytes; body bytes
+/// shift along. Returns the new head length; the caller must grow its
+/// buffered length by the difference.
+fn forceConnectionClose(buf: []u8, head_end: usize, buf_end: usize) usize {
+    const h = dropHeaderLine(buf[0..buf_end], head_end, buf_end, "connection");
+    const add = "Connection: close\r\n";
+    // The head ends with the blank line's CRLF; the new header goes before
+    // it so framing stays "headers, blank, body".
+    const at = h - 2;
+    if (buf_end + add.len > buf.len) return h; // no room; leave dropped-only
+    std.mem.copyBackwards(u8, buf[at + add.len .. buf_end + add.len], buf[at..buf_end]);
+    @memcpy(buf[at .. at + add.len], add);
+    return h + add.len;
+}
+
 /// Removes a single case-insensitive header line (e.g. "Connection: close")
 /// from the buffered head, shifting everything after it left — including any
 /// body bytes already read past the head terminator. Returns the new head length.
@@ -671,7 +808,7 @@ fn buildSockaddr(addr: net.IpAddress, sa: *Sockaddr) posix.socklen_t {
     }
 }
 
-/// Opens a fresh non-blocking socket for the backend; the actual connect()
+/// Opens a fresh nonblocking socket for the backend; the actual connect()
 /// happens as a ring op (submitConnect), so no connect syscall here.
 fn sysOpenBackend(len: posix.socklen_t) !posix.fd_t {
     const domain: u32 = if (len == @sizeOf(posix.sockaddr.in)) posix.AF.INET else posix.AF.INET6;
@@ -777,7 +914,15 @@ fn loopWorker(allocator: std.mem.Allocator, router: *Router, port: u16, opts: Io
                 // MORE, so the fallback path re-arms every time.
                 if (cqe.flags & linux.IORING_CQE_F_MORE == 0) loop.submitAccept();
             } else {
-                loop.onOp(@ptrFromInt(cqe.user_data), cqe.res);
+                // Connection tag: slot index (low 32) + generation. A CQE
+                // from before the slot's latest acquire carries a stale gen
+                // (teardown with ring ops still in flight) and is dropped
+                // instead of corrupting the new occupant.
+                const idx: u32 = @truncate(cqe.user_data);
+                if (@as(usize, idx) >= loop.conns.slots.len) continue; // cannot happen; defensive
+                const conn = &loop.conns.slots[idx];
+                if (conn.gen != @as(u32, @truncate(cqe.user_data >> 32))) continue;
+                loop.onOp(conn, cqe.res);
             }
         }
         _ = loop.ring.submit() catch {};
@@ -794,6 +939,18 @@ test "dropHeaderLine keeps already-read body bytes" {
     try std.testing.expectEqual(head_end - "Connection: keep-alive\r\n".len, new_head_end);
     try std.testing.expectEqualStrings(
         "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nPONG!",
+        buf[0 .. new_head_end + 5],
+    );
+}
+
+test "forceConnectionClose swaps keep-alive for close" {
+    var buf: [128]u8 = undefined;
+    const raw = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: keep-alive\r\n\r\nPONG!";
+    @memcpy(buf[0..raw.len], raw);
+    const head_end = std.mem.indexOf(u8, buf[0..raw.len], "\r\n\r\n").? + 4;
+    const new_head_end = forceConnectionClose(buf[0..], head_end, raw.len);
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nPONG!",
         buf[0 .. new_head_end + 5],
     );
 }
