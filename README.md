@@ -73,6 +73,65 @@ bodies with 415). See `bench/configs/` for ready-made examples per kind
 (`22-io-uring-loops-8` is the fast io_uring setup: pooled backends × 8
 loops).
 
+## Features
+
+**What this is:** an HTTP/1.1 reverse proxy written to compare three
+concurrency models (thread pool, epoll loops, io_uring loops) on equal
+footing — same HTTP parsing, routing, and bench harness for all three.
+
+**What it has:**
+
+- Host-based routing: `vhosts[].hostnames` matched case-insensitively
+  against the `Host` header (port suffix stripped), `default_backends`
+  fallback, silent deny when nothing matches (nginx `return 444`-style).
+- Keep-alive on both hops: client keep-alive (HTTP/1.1 default,
+  HTTP/1.0 explicit) and backend connection reuse — per-client in
+  `threaded`, shared pool in `epoll` and `io_uring` (with reconnect-once
+  for backend-idle-closed sockets).
+- Body relay at any size: `Content-Length` streams through fixed buffers;
+  chunked request/response bodies stream through a framing scanner without
+  ever decoding or buffering them (`threaded`, `epoll`; io_uring relays
+  chunked *responses* and rejects chunked *requests* with 415).
+- Correct framing: 1xx/204/304 and HEAD responses end at the head
+  (`threaded`, `epoll`); close-delimited responses relay to EOF and are
+  never reused.
+- Proxy hygiene: hop-by-hop headers stripped (including anything named by
+  `Connection`), `Connection` rewritten per hop, client-supplied
+  `X-Forwarded-For` replaced (not chained) so it can't be spoofed, `Via`
+  added (`threaded`, `epoll`).
+- Smuggling guards: duplicate/conflicting `Content-Length`, `CL` +
+  `Transfer-Encoding` together, whitespace before the header colon, and
+  over-long heads are all rejected (400/431/415).
+- Dual-stack listeners (v4 arrives v4-mapped) and v4/v6 backends, 8KB
+  request-head cap (431 beyond it), round-robin balancing with DNS
+  resolution at startup, ZON config with search paths, unit-tested
+  parser/chunked framing, and a full bench harness (wrk sweeps → JSONL →
+  notebooks).
+
+**What it does not have (by design, not by accident):**
+
+- No TLS, no HTTP/2 — plain HTTP/1.1 only.
+- No timeouts anywhere: no connect, read, write, or request deadlines.
+- No access log (errors go to stderr via a non-blocking background
+  logger); no `/stats` or metrics endpoint.
+- No backend health checks, no failover/retries (a dead backend is a
+  502 or a closed connection, not a reroute), no graceful shutdown.
+- Round-robin balancing only: no weights, no least-connections, no
+  hashing.
+- No caching, compression, rate limiting, authentication, or request
+  filtering.
+- io_uring gaps: rejects chunked request bodies (415), and has no
+  bodyless-response handling (a `HEAD` request stalls waiting for body
+  bytes the backend correctly never sends).
+
+**Educational or production-ready? Educational.** It is a performance
+laboratory: three interchangeable engines behind one test rig, built to
+measure rather than to serve. The missing timeouts alone disqualify it
+for production (any client can hold connections and buffers forever —
+classic Slowloris shape), and operability (logs, health, shutdown,
+failover) was never built. Take the measurements, the parser, and the
+framing scanner; do not put this on the open internet.
+
 ## Backend
 
 Benchmarks need an upstream. The bench fixture is a small C HTTP/1.1 server
@@ -206,54 +265,3 @@ Older stages were benched with `wrk -t4`; the io_uring stages with `-t8`
 - **Throughput sags past c500 on every server**, including stock
   threaded/epoll rows from before any tuning — systemic to the box
   (thermal soak over long sweeps and same-box `wrk`), not the code.
-
-## Findings
-
-Gotchas and counter-intuitive measurements collected while benching
-(ReleaseFast, wrk). A single `wrk` run is noisy — the pairs below are the
-interesting shapes; verify any claim with a `run-all` sweep before trusting
-it.
-
-- **Direct backend can look *slower* than through the proxy (close mode).**
-  Same load: `wrk -H "Connection: close"` directly at `:8888` measured
-  ~470k req/s while the same read through the io_uring proxy at `:8880`
-  measured ~920k. The `backend.c` fixture answers `Connection: keep-alive`
-  unconditionally, so a close-mode client's sockets stay open until it closes
-  them and wrk can't recycle its 50 connections fast; the proxy answers the
-  client `Connection: close` and tears down immediately, so wrk recycles
-  instantly. The backend isn't slow — it does ~820k at c800 — the *direct*
-  number is the close/connection-recycle path, not the backend.
-- **The backend is usually the wall, and it moved when we multi-threaded it.**
-  The original single-threaded `backend.c` capped at ~165-180k in every mode
-  (one core), silently throttling whatever proxy sat in front of it. After
-  one `SO_REUSEPORT` epoll loop per CPU it reached ~470-820k. Re-check the
-  backend whenever a proxy "improvement" doesn't move end-to-end numbers.
-- **`open` (keep-alive) is CPU-bound; `close` is connection-setup-bound.**
-  threaded (16 threads) beats single-loop epoll on `open` (~150k vs ~35k),
-  but `close` favors epoll. "Which is faster" flips with the mode, so we
-  benchmark and report both separately, per concurrency.
-- **Give `wrk` enough threads.** The harness default (`-t4`) under-drives
-  the proxy once throughput passes a few M req/s on 16 cores: `-t8`
-  raised ceiling runs substantially same-session, while `-t16`
-  oversubscribed (proxy loops + backend threads + wrk > cores) and
-  regressed. Set `WRK_THREADS=8` (or match the box) for ceiling runs;
-  rows record `wrk_threads` so runs stay comparable.
-- **`wrk -L` latency percentiles are unit-lagged.** Sub-millisecond values
-  print as `108.00us`; the harness normalizes `us`/`ms`/`s` → ms. Old rows
-  with a `null` `p*_ms` are a parse artifact, not a missing read.
-- **A preallocated ConnPool looks like a leak, but isn't.** 2048 × 48KB
-  slots reserve ~100MB virtual address space while RSS stays ~15MB, because
-  pages are demand-allocated on first touch. Low RSS vs large VSZ is by
-  design.
-- **(dev) `linux.IoUring` trips the naive "copy the struct" pattern.** Its
-  submit-queue tail lives in the struct's own field, not the shared mmap —
-  queueing an op on a by-value copy and submitting on the original silently
-  submits 0 and the ring never wakes. Queue and submit through one and the
-  same instance.
-- **(dev) io_uring rings share one `RLIMIT_MEMLOCK` quota per user.**
-  Backend (16 × 4096-entry rings) plus proxy rings plus desktop GPU buffers
-  can exhaust the default 8MB and fail `io_setup` racily at startup — the
-  proxy logs `io_uring init failed: error.SystemResources` and that loop
-  silently never serves. Keep ring depth partitioned and modest (the bench
-  backend uses 1024 entries/worker), and check the proxy log if a loop
-  count looks wrong.
