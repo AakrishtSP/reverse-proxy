@@ -233,7 +233,7 @@ const Loop = struct {
         }).pick();
 
 conn.backend_sa_len = buildSockaddr(conn.backend_addr, &conn.backend_sa);
-    conn.backend = sysConnect(@ptrCast(&conn.backend_sa), conn.backend_sa_len) catch |err| {
+    conn.backend = sysOpenBackend(conn.backend_sa_len) catch |err| {
             log.fmt("connect failed: {any}", .{err});
             self.sendSimple(conn, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
             return;
@@ -371,7 +371,7 @@ conn.backend_sa_len = buildSockaddr(conn.backend_addr, &conn.backend_sa);
                 // rewrite "Connection: close" out of the head so the client can
                 // reuse the connection (Content-Length still frames the body)
                 const old_end = conn.resp_head_end;
-                conn.resp_head_end = dropHeaderLine(conn.resp[0..conn.resp_end], conn.resp_head_end, "connection");
+                conn.resp_head_end = dropHeaderLine(conn.resp[0..conn.resp_end], conn.resp_head_end, conn.resp_end, "connection");
                 conn.resp_end -= (old_end - conn.resp_head_end);
             }
         }
@@ -481,8 +481,9 @@ fn indexOfHeaderValue(head: []const u8, name: []const u8, needle: []const u8) bo
 }
 
 /// Removes a single case-insensitive header line (e.g. "Connection: close")
-/// from the buffered head, shifting the tail left. Returns the new head length.
-fn dropHeaderLine(head: []u8, head_end: usize, name: []const u8) usize {
+/// from the buffered head, shifting everything after it left — including any
+/// body bytes already read past the head terminator. Returns the new head length.
+fn dropHeaderLine(head: []u8, head_end: usize, buf_end: usize, name: []const u8) usize {
     const first = std.mem.indexOf(u8, head[0..head_end], "\r\n") orelse return head_end;
     var line_start = first + 2; // skip the status line
     while (line_start < head_end) {
@@ -492,7 +493,7 @@ fn dropHeaderLine(head: []u8, head_end: usize, name: []const u8) usize {
             const colon = std.mem.indexOfScalar(u8, line, ':') orelse return head_end;
             if (std.ascii.eqlIgnoreCase(line[0..colon], name)) {
                 const removed = (eol + 2) - line_start;
-                std.mem.copyForwards(u8, head[line_start..], head[eol + 2 .. head_end]);
+                std.mem.copyForwards(u8, head[line_start .. buf_end - removed], head[eol + 2 .. buf_end]);
                 return head_end - removed;
             }
         }
@@ -552,18 +553,13 @@ fn buildSockaddr(addr: net.IpAddress, sa: *Sockaddr) posix.socklen_t {
     }
 }
 
-/// Opens a fresh non-blocking socket already making a connect() against the
-/// backend; EINPROGRESS is fine — the io_uring connect follows immediately.
-fn sysConnect(sa: *const posix.sockaddr, len: posix.socklen_t) !posix.fd_t {
+/// Opens a fresh non-blocking socket for the backend; the actual connect()
+/// happens as a ring op (submitConnect), so no connect syscall here.
+fn sysOpenBackend(len: posix.socklen_t) !posix.fd_t {
     const domain: u32 = if (len == @sizeOf(posix.sockaddr.in)) posix.AF.INET else posix.AF.INET6;
     const fd = try sysSocket(domain, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, posix.IPPROTO.TCP);
     errdefer sysClose(fd);
     enableTcpNoDelay(fd);
-    const rc = linux.connect(fd, sa, len);
-    if (rc != 0) {
-        const err = posix.errno(rc);
-        if (err != .INPROGRESS) return posix.unexpectedErrno(err);
-    }
     return fd;
 }
 
@@ -591,7 +587,7 @@ pub fn run(allocator: std.mem.Allocator, router: *Router, port: u16, opts: IoUri
         .scope_id = 0,
     };
     try check(linux.bind(listen_fd, @ptrCast(&bind_addr), @sizeOf(posix.sockaddr.in6)));
-    try check(linux.listen(listen_fd, 128));
+    try check(linux.listen(listen_fd, 4096));
 
     var conns = try ConnPool.init(allocator, 1024);
     defer conns.deinit(allocator);
@@ -615,4 +611,18 @@ pub fn run(allocator: std.mem.Allocator, router: *Router, port: u16, opts: IoUri
         }
         _ = loop.ring.submit() catch {};
     }
+}
+
+test "dropHeaderLine keeps already-read body bytes" {
+    // Mirrors the bench backend's reply: head + 5 body bytes in one read.
+    var buf: [128]u8 = undefined;
+    const raw = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: keep-alive\r\n\r\nPONG!";
+    @memcpy(buf[0..raw.len], raw);
+    const head_end = std.mem.indexOf(u8, buf[0..raw.len], "\r\n\r\n").? + 4;
+    const new_head_end = dropHeaderLine(buf[0..raw.len], head_end, raw.len, "connection");
+    try std.testing.expectEqual(head_end - "Connection: keep-alive\r\n".len, new_head_end);
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nPONG!",
+        buf[0 .. new_head_end + 5],
+    );
 }

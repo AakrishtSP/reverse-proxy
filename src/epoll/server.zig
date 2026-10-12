@@ -898,7 +898,7 @@ fn loopWorker(allocator: std.mem.Allocator, router: *Router, port: u16, opts: Ep
         .scope_id = 0,
     };
     if (linux.bind(listen_fd, @ptrCast(&bind_addr), @sizeOf(posix.sockaddr.in6)) != 0) return;
-    if (linux.listen(listen_fd, 128) != 0) return;
+    if (linux.listen(listen_fd, 4096) != 0) return;
 
     const epfd = epollCreate() catch |err| {
         log.fmt("epoll_create1 failed: {any}", .{err});

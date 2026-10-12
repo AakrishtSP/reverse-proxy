@@ -149,7 +149,7 @@ pub fn run(allocator: std.mem.Allocator, router: *Router, port: u16, opts: Threa
         .scope_id = 0,
     };
     try check(linux.bind(listen_fd, @ptrCast(&bind_addr), @sizeOf(posix.sockaddr.in6)));
-    try check(linux.listen(listen_fd, 128));
+    try check(linux.listen(listen_fd, 4096));
 
     // Take opts.pool_threads - 1 slots from worker threads; this (main) thread
     // becomes the last worker. Keeps run() blocking forever like the old
