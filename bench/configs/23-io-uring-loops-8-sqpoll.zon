@@ -1,0 +1,15 @@
+.{
+    .listen = 8880,
+    .server = .{
+        .kind = .io_uring,
+        .io_uring = .{
+            .client_keepalive = true,
+            .backend_keepalive = true,
+            .pool_size = 100,
+            .loops = 8,
+            .sqpoll = true,
+        },
+    },
+    .vhosts = .{},
+    .default_backends = .{"127.0.0.1:8888"},
+}

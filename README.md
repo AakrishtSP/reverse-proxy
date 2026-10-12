@@ -66,7 +66,7 @@ no response (nginx `return 444`-style deny).
 
 `.server` holds a `kind` plus per-kind options (`threaded.pool_threads`,
 `epoll.loops` / `pool_size` / `max_connections`, `io_uring.loops` /
-`pool_size` / `max_connections` / `entries`). Every
+`pool_size` / `max_connections` / `sqpoll` / `entries`). Every
 kind shares `client_keepalive`, `backend_keepalive`, and `chunked_requests`
 (`io_uring` serves `chunked_requests = false` for now and rejects chunked
 bodies with 415). See `bench/configs/` for ready-made examples per kind

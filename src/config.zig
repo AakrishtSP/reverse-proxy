@@ -73,6 +73,10 @@ pub const IoUringConfig = struct {
     /// the single-core ceiling scales across cores. `1` is the classic
     /// single-loop server.
     loops: usize = 1,
+    /// Submit via a kernel poll thread instead of the submit syscall.
+    /// Experimental: removes the io_uring_enter per batch at the cost of one
+    /// kernel thread per loop; measure before enabling.
+    sqpoll: bool = false,
     /// io_uring submission/completion queue depth (power of two).
     entries: u16 = 4096,
 };
@@ -115,6 +119,7 @@ const default_config_zon =
     \\            .pool_size = 100,
     \\            .max_connections = 1024,
     \\            .loops = 1,
+    \\            .sqpoll = false,
     \\            .entries = 4096,
     \\        },
     \\    },
@@ -188,7 +193,7 @@ pub fn printConfig(config: Config, stdio: *StdIo) !void {
     try stdio.println("\t.server: .{{", .{});
     try stdio.println("\t\t.kind: .{s},", .{@tagName(config.server.kind)});
     try stdio.println(
-        "\t\t.threaded: .{{.pool_threads: {d}, .client_keepalive: {}, .backend_keepalive: {}, .chunked_requests: {}}},\n\t\t.epoll: .{{.client_keepalive: {}, .backend_keepalive: {}, .chunked_requests: {}, .pool_size: {d}, .max_connections: {d}, .loops: {d}}},\n\t\t.io_uring: .{{.client_keepalive: {}, .backend_keepalive: {}, .chunked_requests: {}, .pool_size: {d}, .max_connections: {d}, .loops: {d}, .entries: {d}}},\n\t}},\n\t.vhosts: ",
+        "\t\t.threaded: .{{.pool_threads: {d}, .client_keepalive: {}, .backend_keepalive: {}, .chunked_requests: {}}},\n\t\t.epoll: .{{.client_keepalive: {}, .backend_keepalive: {}, .chunked_requests: {}, .pool_size: {d}, .max_connections: {d}, .loops: {d}}},\n\t\t.io_uring: .{{.client_keepalive: {}, .backend_keepalive: {}, .chunked_requests: {}, .pool_size: {d}, .max_connections: {d}, .loops: {d}, .sqpoll: {}, .entries: {d}}},\n\t}},\n\t.vhosts: ",
         .{
             config.server.threaded.pool_threads,
             config.server.threaded.client_keepalive,
@@ -206,6 +211,7 @@ pub fn printConfig(config: Config, stdio: *StdIo) !void {
             config.server.io_uring.pool_size,
             config.server.io_uring.max_connections,
             config.server.io_uring.loops,
+            config.server.io_uring.sqpoll,
             config.server.io_uring.entries,
         },
     );

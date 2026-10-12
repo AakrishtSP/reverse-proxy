@@ -164,13 +164,25 @@ const Loop = struct {
     conns: ConnPool,
     pool: Pool,
     opts: IoUringConfig,
+    multishot_ok: bool = true, // cleared if the kernel rejects multishot accept
+    accept_seen: bool = false, // any successful accept yet (tells EINVAL apart)
 
     // ---- submit helpers (each queues one op; flushed by run's main loop) ----
 
+    /// One standing multishot accept (pre-5.19 kernels fall back to re-armed
+    /// one-shot: see acceptReady). Re-armed by the event loop only when a CQE
+    /// arrives without IORING_CQE_F_MORE, i.e. the multishot terminated.
     fn submitAccept(self: *Loop) void {
-        _ = self.ring.accept(acceptable_magic, self.listen_fd, null, null, posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK) catch {
-            return;
-        };
+        const flags = posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK;
+        if (self.multishot_ok) {
+            _ = self.ring.accept_multishot(acceptable_magic, self.listen_fd, null, null, flags) catch {
+                return;
+            };
+        } else {
+            _ = self.ring.accept(acceptable_magic, self.listen_fd, null, null, flags) catch {
+                return;
+            };
+        }
     }
 
     fn submitRecv(self: *Loop, conn: *Conn, fd: posix.fd_t, buf: []u8) void {
@@ -197,11 +209,19 @@ const Loop = struct {
     // ---- accept ----
 
     fn acceptReady(self: *Loop, res: i32) void {
-        defer self.submitAccept(); // keep exactly one accept in flight
         if (res < 0) {
-            log.fmt("accept failed: {any}", .{posix.errno(@intCast(-res))});
+            const err = posix.errno(@intCast(-res));
+            if (!self.accept_seen and err == .INVAL and self.multishot_ok) {
+                // Kernel predates multishot accept (5.19): fall back to
+                // re-armed one-shot accepts. The event loop re-arms below
+                // since this CQE carries no MORE flag.
+                self.multishot_ok = false;
+                return;
+            }
+            log.fmt("accept failed: {any}", .{err});
             return;
         }
+        self.accept_seen = true;
         const fd: posix.fd_t = @intCast(res);
         const conn = self.conns.acquire() orelse {
             sysClose(fd); // no slots: refuse rather than queue
@@ -693,9 +713,22 @@ fn loopWorker(allocator: std.mem.Allocator, router: *Router, port: u16, opts: Io
     while (remaining > 1) : (remaining /= 2) per_loop_entries /= 2;
     per_loop_entries = @max(per_loop_entries, 64);
 
-    var ring = linux.IoUring.init(per_loop_entries, 0) catch |err| {
-        log.fmt("io_uring init failed: {any}", .{err});
-        return;
+    // A kernel poll thread drains the submission queue instead of the
+    // submit syscall; falls back to plain submit when the kernel refuses
+    // (e.g. lacking privileges on older kernels).
+    var ring = linux.IoUring.init(
+        per_loop_entries,
+        if (opts.sqpoll) linux.IORING_SETUP_SQPOLL else 0,
+    ) catch |err| sqpoll_fallback: {
+        if (!opts.sqpoll) {
+            log.fmt("io_uring init failed: {any}", .{err});
+            return;
+        }
+        log.fmt("io_uring sqpoll init failed ({any}); falling back to submit", .{err});
+        break :sqpoll_fallback linux.IoUring.init(per_loop_entries, 0) catch |err2| {
+            log.fmt("io_uring init failed: {any}", .{err2});
+            return;
+        };
     };
     defer ring.deinit();
 
@@ -739,6 +772,10 @@ fn loopWorker(allocator: std.mem.Allocator, router: *Router, port: u16, opts: Io
         for (cqes[0..n]) |cqe| {
             if (cqe.user_data == acceptable_magic) {
                 loop.acceptReady(cqe.res);
+                // Multishot keeps firing on its own; only re-arm when it
+                // terminated (no MORE flag). One-shot accepts never carry
+                // MORE, so the fallback path re-arms every time.
+                if (cqe.flags & linux.IORING_CQE_F_MORE == 0) loop.submitAccept();
             } else {
                 loop.onOp(@ptrFromInt(cqe.user_data), cqe.res);
             }
