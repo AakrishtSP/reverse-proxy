@@ -124,7 +124,7 @@ footing — same HTTP parsing, routing, and bench harness for all three.
   bodyless-response handling (a `HEAD` request stalls waiting for body
   bytes the backend correctly never sends).
 
-**Educational or production-ready? Educational.** It is a performance
+**Educational.** It is a performance
 laboratory: three interchangeable engines behind one test rig, built to
 measure rather than to serve. The missing timeouts alone disqualify it
 for production (any client can hold connections and buffers forever —
