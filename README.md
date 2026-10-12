@@ -242,6 +242,17 @@ one-shot clients, `open` = keep-alive clients.
 Older stages were benched with `wrk -t4`; the io_uring stages with `-t8`
 (recorded per row in `wrk_threads`). Takeaways:
 
+![Fastest config per server kind](analysis/charts/best-by-kind.png)
+
+![Keep-alive throughput vs concurrency](analysis/charts/throughput-open.png)
+
+![One-shot throughput vs concurrency](analysis/charts/throughput-close.png)
+
+![epoll loop scaling](analysis/charts/epoll-loops-scaling.png)
+
+Regenerate with `.venv/bin/python analysis/make_charts.py` after any
+`run-all`/`run-missing` sweep.
+
 - **Fastest is io_uring with pooled backends × 8 loops** (`22`):
   ~527k open / ~125k close. Single-loop io_uring (`15`) does ~123k /
   ~27k, so multi-loop is worth ~4× — one core with one in-flight op per
