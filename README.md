@@ -278,3 +278,8 @@ Regenerate with `.venv/bin/python analysis/make_charts.py` after any
 - **Throughput sags past c500 on every server**, including stock
   threaded/epoll rows from before any tuning — systemic to the box
   (thermal soak over long sweeps and same-box `wrk`), not the code.
+
+## License
+
+WTFPL v2 — see [LICENSE](LICENSE). Take the measurements, the parser and the
+framing scanner; just do not put this on the open internet (no timeouts).
