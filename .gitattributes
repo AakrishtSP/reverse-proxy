@@ -1,0 +1,3 @@
+# analysis/ is a notebook harness, not the project: keep GitHub from
+# labelling this repo as a Jupyter project.
+*.ipynb linguist-detectable=false
